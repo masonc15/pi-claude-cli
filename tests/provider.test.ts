@@ -55,20 +55,17 @@ const mockModels = [
 
 vi.mock("@mariozechner/pi-ai", () => ({
   getModels: vi.fn(() => mockModels),
-  createAssistantMessageEventStream: vi.fn(() => {
+  AssistantMessageEventStream: vi.fn(function (this: any) {
     const events: any[] = [];
-    const stream = {
-      push: vi.fn((event: any) => events.push(event)),
-      end: vi.fn(),
-      _events: events,
-    };
-    return stream;
+    this.push = vi.fn((event: any) => events.push(event));
+    this.end = vi.fn();
+    this._events = events;
   }),
   calculateCost: vi.fn(),
 }));
 
 import spawn from "cross-spawn";
-import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+import { AssistantMessageEventStream } from "@mariozechner/pi-ai";
 import { streamViaCli } from "../src/provider";
 
 describe("provider registration (default export)", () => {
@@ -247,8 +244,8 @@ describe("streamViaCli", () => {
     await vi.advanceTimersByTimeAsync(100);
 
     // The stream should have received events from the event bridge
-    const mockStream = (createAssistantMessageEventStream as any).mock
-      .results[0].value;
+    const mockStream = (AssistantMessageEventStream as any).mock
+      .instances[0];
     const events = mockStream._events;
 
     // Verify we got the expected event types
@@ -280,8 +277,8 @@ describe("streamViaCli", () => {
     proc.stdout.end();
     await vi.advanceTimersByTimeAsync(100);
 
-    const mockStream = (createAssistantMessageEventStream as any).mock
-      .results[0].value;
+    const mockStream = (AssistantMessageEventStream as any).mock
+      .instances[0];
     const errorEvent = mockStream._events.find((e: any) => e.type === "error");
     expect(errorEvent).toBeDefined();
     expect(mockStream.end).toHaveBeenCalled();
@@ -553,8 +550,8 @@ describe("streamViaCli", () => {
     await vi.advanceTimersByTimeAsync(100);
 
     // Verify the stream still received text events after the control_request
-    const mockStream = (createAssistantMessageEventStream as any).mock
-      .results[0].value;
+    const mockStream = (AssistantMessageEventStream as any).mock
+      .instances[0];
     const events = mockStream._events;
     const eventTypes = events.map((e: any) => e.type);
     expect(eventTypes).toContain("text_start");
@@ -661,8 +658,8 @@ describe("streamViaCli", () => {
       expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
 
       // Verify the stream received a done event (from event bridge handleMessageStop)
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const events = mockStream._events;
       const eventTypes = events.map((e: any) => e.type);
       expect(eventTypes).toContain("done");
@@ -972,8 +969,8 @@ describe("streamViaCli", () => {
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const errorEvent = mockStream._events.find(
         (e: any) => e.type === "error",
       );
@@ -999,8 +996,8 @@ describe("streamViaCli", () => {
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const errorEvent = mockStream._events.find(
         (e: any) => e.type === "error",
       );
@@ -1041,8 +1038,8 @@ describe("streamViaCli", () => {
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const errorEvent = mockStream._events.find(
         (e: any) => e.type === "error",
       );
@@ -1109,8 +1106,8 @@ describe("streamViaCli", () => {
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       // Should have done event but no error event
       const eventTypes = mockStream._events.map((e: any) => e.type);
       expect(eventTypes).toContain("done");
@@ -1133,8 +1130,8 @@ describe("streamViaCli", () => {
       // Advance timers by 180 seconds without writing to stdout
       await vi.advanceTimersByTimeAsync(180_000);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const errorEvent = mockStream._events.find(
         (e: any) => e.type === "error",
       );
@@ -1177,8 +1174,8 @@ describe("streamViaCli", () => {
       // Advance another 170s (340s total, 170s since last line) -- should NOT timeout
       await vi.advanceTimersByTimeAsync(170_000);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const errorEvent = mockStream._events.find(
         (e: any) => e.type === "error",
       );
@@ -1233,8 +1230,8 @@ describe("streamViaCli", () => {
       // Advance past 180s -- should NOT timeout since result was received
       await vi.advanceTimersByTimeAsync(180_000);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const errorEvents = mockStream._events.filter(
         (e: any) => e.type === "error",
       );
@@ -1411,8 +1408,8 @@ describe("streamViaCli", () => {
       // Advance past cleanup
       vi.advanceTimersByTime(500);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const doneEvent = mockStream._events.find((e: any) => e.type === "done");
       expect(doneEvent).toBeDefined();
       // Reason should be overridden to "stop" (not "toolUse")
@@ -1487,8 +1484,8 @@ describe("streamViaCli", () => {
       // Break-early kills and closes readline
       await vi.advanceTimersByTimeAsync(100);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const doneEvent = mockStream._events.find((e: any) => e.type === "done");
       expect(doneEvent).toBeDefined();
       expect(doneEvent.reason).toBe("toolUse");
@@ -1543,8 +1540,8 @@ describe("streamViaCli", () => {
 
       vi.advanceTimersByTime(500);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const doneEvent = mockStream._events.find((e: any) => e.type === "done");
       expect(doneEvent).toBeDefined();
       // Should not crash — stopReason should be "stop" (end_turn maps to stop)
@@ -1612,8 +1609,8 @@ describe("streamViaCli", () => {
 
       vi.advanceTimersByTime(500);
 
-      const mockStream = (createAssistantMessageEventStream as any).mock
-        .results[0].value;
+      const mockStream = (AssistantMessageEventStream as any).mock
+        .instances[0];
       const doneEvent = mockStream._events.find((e: any) => e.type === "done");
       expect(doneEvent).toBeDefined();
       expect(doneEvent.reason).toBe("length");
