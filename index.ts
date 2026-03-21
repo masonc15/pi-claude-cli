@@ -81,6 +81,15 @@ export default function (pi: ExtensionAPI) {
       maxTokens: model.maxTokens,
     }));
 
+    // Ensure all registered tools are active so pi can execute them.
+    // Some tools (find, grep, ls) are registered but not activated by default.
+    pi.on("session_start", async () => {
+      const allTools = pi.getAllTools();
+      if (Array.isArray(allTools)) {
+        pi.setActiveTools(allTools.map((t: any) => t.name));
+      }
+    });
+
     pi.registerProvider(PROVIDER_ID, {
       baseUrl: "pi-claude-cli",
       apiKey: "unused",
