@@ -67,6 +67,8 @@ export function streamViaCli(
   context: { messages: any[]; systemPrompt?: string },
   options?: StreamViaCLiOptions,
 ): AssistantMessageEventStream {
+  // @ts-expect-error — tsc can't verify AssistantMessageEventStream is a value
+  // through pi-ai's `export *` re-export chain. The class constructor exists at runtime.
   const stream = new AssistantMessageEventStream();
 
   (async () => {
