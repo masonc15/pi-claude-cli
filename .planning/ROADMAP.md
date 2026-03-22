@@ -39,7 +39,10 @@
   4. `ClaudeResultMessage` includes `is_error` and `errors` fields for the "success with error" edge case
   5. All new types compile cleanly with zero `as any` casts needed by consuming code
 
-**Plans**: TBD
+**Plans:** 1 plan
+
+Plans:
+- [ ] 07-01-PLAN.md -- Define new NDJSON types, expand existing types, replace as-any casts in consuming code
 
 ### Phase 8: Error Passthrough
 **Goal**: Users see clear, actionable error messages for every CLI failure mode instead of opaque "stream ended" or silent hangs
@@ -93,7 +96,7 @@ Recommended serial order: 7 -> 8 -> 9 (error plumbing validates assistant messag
 | 4. Custom Tool MCP Proxy | v1.0 | 2/2 | Complete | 2026-03-15 |
 | 5. Platform Hardening | v1.0 | 2/2 | Complete | 2026-03-15 |
 | 6. Testing and Release Pipeline | v1.0 | 2/2 | Complete | 2026-03-15 |
-| 7. Type Foundation | v0.4.0 | 0/? | Not started | - |
+| 7. Type Foundation | v0.4.0 | 0/1 | Planned | - |
 | 8. Error Passthrough | v0.4.0 | 0/? | Not started | - |
 | 9. Sub-Agent Progress | v0.4.0 | 0/? | Not started | - |
 | 10. Documentation | v0.4.0 | 0/? | Not started | - |
