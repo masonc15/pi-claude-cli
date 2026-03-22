@@ -5,14 +5,29 @@
 export interface ClaudeStreamEventMessage {
   type: "stream_event";
   event: ClaudeApiEvent;
+  parent_tool_use_id?: string | null;
+  uuid?: string;
+  session_id?: string;
 }
 
 export interface ClaudeResultMessage {
   type: "result";
-  subtype: "success" | "error";
+  subtype:
+    | "success"
+    | "error"
+    | "error_during_execution"
+    | "error_max_turns"
+    | "error_max_budget_usd";
   result?: string;
   error?: string;
+  is_error?: boolean;
+  errors?: string[];
   session_id?: string;
+  total_cost_usd?: number;
+  usage?: ClaudeUsage;
+  duration_ms?: number;
+  duration_api_ms?: number;
+  num_turns?: number;
 }
 
 export interface ClaudeSystemMessage {
@@ -32,11 +47,35 @@ export interface ClaudeControlRequest {
   };
 }
 
+// Error category from the Claude CLI assistant message
+export type AssistantMessageError =
+  | "authentication_failed"
+  | "billing_error"
+  | "rate_limit"
+  | "invalid_request"
+  | "server_error"
+  | "unknown";
+
+export interface ClaudeAssistantMessage {
+  type: "assistant";
+  message?: {
+    content?: unknown[];
+    model?: string;
+    stop_reason?: string;
+    usage?: ClaudeUsage;
+  };
+  error?: AssistantMessageError;
+  parent_tool_use_id?: string | null;
+  uuid?: string;
+  session_id?: string;
+}
+
 export type NdjsonMessage =
   | ClaudeStreamEventMessage
   | ClaudeResultMessage
   | ClaudeSystemMessage
-  | ClaudeControlRequest;
+  | ClaudeControlRequest
+  | ClaudeAssistantMessage;
 
 // Claude API event types (inside stream_event wrapper)
 
@@ -81,5 +120,5 @@ export interface ClaudeUsage {
 export interface TrackedContentBlock {
   type: "text" | "thinking";
   text: string;
-  index: number; // Claude's content_block index
+  index?: number; // Claude's content_block index, deleted after block_stop
 }
