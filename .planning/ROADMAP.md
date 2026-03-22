@@ -42,7 +42,7 @@
 **Plans:** 1 plan
 
 Plans:
-- [ ] 07-01-PLAN.md -- Define new NDJSON types, expand existing types, replace as-any casts in consuming code
+- [x] 07-01-PLAN.md -- Define new NDJSON types, expand existing types, replace as-any casts in consuming code
 
 ### Phase 8: Error Passthrough
 **Goal**: Users see clear, actionable error messages for every CLI failure mode instead of opaque "stream ended" or silent hangs
