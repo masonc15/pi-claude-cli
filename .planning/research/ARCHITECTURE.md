@@ -1,538 +1,490 @@
-# Architecture Patterns
+# Architecture Research: Observability Integration (v0.4.0)
 
-**Domain:** CLI subprocess LLM provider extension for pi coding agent
-**Researched:** 2026-03-13
+**Domain:** CLI subprocess NDJSON stream event handling for observability
+**Researched:** 2026-03-21
+**Confidence:** HIGH (codebase verified, official SDK docs verified, NDJSON protocol verified)
 
-## Recommended Architecture
+## Executive Summary
 
-This extension acts as a **bridge** between pi's provider interface and the Claude Code CLI subprocess. It translates pi's `streamSimple` event contract into spawning a `claude -p` subprocess, feeding it a flattened conversation prompt via stream-json input, intercepting tool-use proposals via the control protocol, and streaming Claude API events back as pi `AssistantMessageEventStream` events.
+The v0.4.0 observability milestone adds two new data flows to the existing NDJSON stream parser:
+1. **Sub-agent progress visibility** -- surfacing events currently dropped by the `isTopLevel` filter in `provider.ts`
+2. **Context limit error passthrough** -- detecting and forwarding errors from `assistant` and `result` NDJSON messages
 
-### High-Level Architecture
+Both features integrate into the existing stream processing pipeline without modifying the event bridge or break-early logic. The changes are additive: new message type handlers in the `rl.on("line")` callback and new type definitions. No changes needed to `event-bridge.ts`, `stream-parser.ts`, or `process-manager.ts`.
 
-```
-+------------------+        +---------------------+        +-------------------+
-|  pi coding agent |        |  pi-claude-cli      |        |  claude -p        |
-|  (host runtime)  |        |  (extension)        |        |  (subprocess)     |
-|                  |        |                     |        |                   |
-|  registerProvider|------->| streamSimple()      |        |                   |
-|                  |        |   |                 |        |                   |
-|                  |        |   +-> PromptBuilder |        |                   |
-|                  |        |   +-> ProcessMgr ---|------->| stdin (NDJSON)    |
-|                  |        |   +-> StreamParser <|--------| stdout (NDJSON)   |
-|                  |        |   +-> ToolRouter    |        |                   |
-|  EventStream  <--|--------| EventBridge         |        |                   |
-|                  |        |                     |        |                   |
-|  tool_call event |------->| ToolMapper          |        |                   |
-|  tool_result     |        |   (name+arg xlation)|        |                   |
-|                  |        |                     |        |                   |
-|  custom tools    |        | McpToolProxy -------|------->| MCP stdio server  |
-|  (registered)    |        |   (exposes pi tools)|        | (--mcp-config)    |
-+------------------+        +---------------------+        +-------------------+
-```
+## Current Architecture (What Exists)
 
-### Component Boundaries
-
-| Component | Responsibility | Communicates With |
-|-----------|---------------|-------------------|
-| **ExtensionEntry** (`index.ts`) | Extension lifecycle: registers provider, wires up models, handles activation/deactivation | pi `ExtensionAPI`, all internal components |
-| **PromptBuilder** | Converts pi conversation history (messages, tool calls, tool results) into a flattened text prompt for `claude -p` | ExtensionEntry (receives context), ProcessManager (provides prompt) |
-| **ProcessManager** | Spawns `claude -p` subprocess, writes NDJSON to stdin, reads NDJSON from stdout, manages subprocess lifecycle | PromptBuilder (receives prompt), StreamParser (feeds raw lines), ToolRouter (sends control_responses) |
-| **StreamParser** | Parses NDJSON lines from subprocess stdout, classifies messages as `stream_event` (API events) or `control_request` (tool approval) | ProcessManager (reads lines), EventBridge (forwards API events), ToolRouter (forwards control_requests) |
-| **ToolRouter** | Decides tool approval/denial based on tool name prefix: deny built-in tools (pi executes them), allow `mcp__` prefixed tools (Claude executes MCP calls) | StreamParser (receives control_requests), ProcessManager (writes control_responses to stdin) |
-| **EventBridge** | Translates Claude API streaming events (`content_block_start/delta/stop`, `message_start/delta/stop`) into pi `AssistantMessageEventStream` events (`text_start/delta/end`, `toolcall_start/delta/end`, `thinking_start/delta/end`, `start`, `done`, `error`) | StreamParser (receives parsed events), pi EventStream (pushes translated events) |
-| **ToolMapper** | Bidirectional translation of tool names (Claude `Read` <-> pi `read`, Claude `Glob` <-> pi `find`) and arguments (`file_path` <-> `path`, `old_string` <-> `oldText`) | EventBridge (translates outbound tool_call events), PromptBuilder (translates inbound tool_result names) |
-| **McpToolProxy** | Stdio MCP server that exposes pi's custom-registered tools to the Claude subprocess so Claude can call them via `mcp__custom-tools__<name>` | Claude subprocess (MCP client), pi tool registry (reads active custom tools) |
-
-## Data Flow
-
-### Primary Request Flow (per LLM turn)
+### System Overview
 
 ```
-1. pi calls streamSimple(model, context, options)
-   |
-2. PromptBuilder flattens context.messages into text prompt
-   - USER: <user message>
-   - ASSISTANT: <assistant response>
-   - TOOL RESULT [tool_name]: <result content>
-   |
-3. ProcessManager spawns: claude -p "<prompt>"
-     --input-format stream-json
-     --output-format stream-json
-     --verbose
-     --include-partial-messages
-     --model <model.id>
-     --mcp-config <tempMcpConfig.json>   (if custom tools exist)
-     [--strict-mcp-config false]          (if user wants .mcp.json to load)
-   |
-4. StreamParser reads stdout line-by-line (NDJSON)
-   |
-   +---> stream_event line --> EventBridge
-   |     |
-   |     +-> message_start      --> push { type: "start", partial }
-   |     +-> content_block_start
-   |     |   +-> type: "text"   --> push { type: "text_start" }
-   |     |   +-> type: "tool_use" --> push { type: "toolcall_start" }
-   |     |       (ToolMapper translates name+args)
-   |     |   +-> type: "thinking" --> push { type: "thinking_start" }
-   |     +-> content_block_delta
-   |     |   +-> text_delta     --> push { type: "text_delta" }
-   |     |   +-> input_json_delta --> push { type: "toolcall_delta" }
-   |     |   +-> thinking_delta --> push { type: "thinking_delta" }
-   |     +-> content_block_stop --> push { type: "text_end" / "toolcall_end" / "thinking_end" }
-   |     +-> message_delta      --> update usage/stopReason
-   |     +-> message_stop       --> push { type: "done", message }
-   |
-   +---> control_request line --> ToolRouter
-         |
-         +-> subtype: "can_use_tool"
-         |   +-> tool_name starts with "mcp__"?
-         |   |   YES --> write control_response { behavior: "allow" } to stdin
-         |   |   NO  --> write control_response { behavior: "deny" } to stdin
-         |   |           EventBridge pushes toolcall events with mapped name/args
-         |
-5. Subprocess exits when message completes
-   |
-6. EventBridge pushes final { type: "done", message } and calls stream.end()
+pi Agent Loop
+    |
+    v
+streamViaCli()          [provider.ts]
+    |
+    +-- spawnClaude()    [process-manager.ts]
+    |       |
+    |       v
+    |   claude -p --stream-json subprocess
+    |       |
+    |       v (stdout NDJSON)
+    +-- readline "line" event handler  [provider.ts:226]
+            |
+            +-- parseLine()           [stream-parser.ts]
+            |
+            +-- Route by msg.type:
+            |   |
+            |   +-- "stream_event"
+            |   |       |
+            |   |       +-- isTopLevel? --> bridge.handleEvent()  [event-bridge.ts]
+            |   |       |                      |
+            |   |       |                      v
+            |   |       |               stream.push(pi events)
+            |   |       |
+            |   |       +-- !isTopLevel --> DROPPED (today)
+            |   |       |
+            |   |       +-- message_stop + sawTool --> break-early (kill proc)
+            |   |
+            |   +-- "control_request"  --> handleControlRequest()  [control-handler.ts]
+            |   |
+            |   +-- "result"           --> endStreamWithError() or cleanupProcess()
+            |   |
+            |   +-- "system"           --> IGNORED (today)
+            |   +-- "assistant"        --> IGNORED (today)
+            |   +-- "user"             --> IGNORED (today)
+            |
+            v
+stream.push({ type: "done" })
 ```
 
-### Control Protocol Messages (NDJSON on stdin/stdout)
+### NDJSON Message Types from Claude CLI
 
-**Subprocess stdout -- control_request:**
-```json
-{
-  "type": "control_request",
-  "request_id": "req_1_abc123",
-  "request": {
-    "subtype": "can_use_tool",
-    "tool_name": "Bash",
-    "input": { "command": "ls /home" }
+The Claude CLI (`--output-format stream-json`) emits these NDJSON message types:
+
+| Type | Currently Handled | Fields | Purpose |
+|------|:-:|--------|---------|
+| `stream_event` | YES | `event`, `parent_tool_use_id`, `uuid`, `session_id` | Raw Claude API streaming events (text/tool deltas) |
+| `result` | PARTIAL | `subtype`, `is_error`, `error`, `result`, `session_id`, `usage` | Final message. Subtypes: `success`, `error_max_turns`, `error_max_budget_usd`, `error_during_execution` |
+| `system` | NO | `subtype`, `data`, `session_id` | Session lifecycle. Subtypes: `init`, `compact_boundary` |
+| `assistant` | NO | `message.content[]`, `message.model`, `error`, `parent_tool_use_id` | Complete assistant turn (after streaming). Has `error` field for API errors |
+| `user` | NO | `content`, `tool_use_result`, `parent_tool_use_id` | Tool results sent back to Claude |
+| `control_request` | YES | `request_id`, `request.subtype`, `request.tool_name` | Permission prompts |
+
+**Critical discovery:** `assistant` messages have an `error` field of type `AssistantMessageError`:
+```typescript
+type AssistantMessageError =
+  | "authentication_failed"
+  | "billing_error"
+  | "rate_limit"
+  | "invalid_request"  // <-- context limit errors surface here
+  | "server_error"
+  | "unknown";
+```
+
+**Critical discovery:** `result` messages have more subtypes than currently handled:
+- `success` -- task completed
+- `error_max_turns` -- hit maxTurns limit
+- `error_max_budget_usd` -- hit budget limit
+- `error_during_execution` -- API failure or cancelled request
+- Currently the code only checks `subtype === "error"` which may not match these
+
+### Sub-Agent Event Flow (What Happens Today)
+
+When Claude's internal Agent/Task tool runs, the CLI emits a nested sequence:
+
+```
+Top-level: stream_event { event: content_block_start, type: "tool_use", name: "Agent" } parent_tool_use_id: null
+Top-level: stream_event { event: message_stop } parent_tool_use_id: null
+  Sub-agent: system   { subtype: "init" }                         parent_tool_use_id: "toolu_abc"
+  Sub-agent: stream_event { event: message_start }                parent_tool_use_id: "toolu_abc"
+  Sub-agent: stream_event { event: content_block_start, tool_use: "Read" } parent_tool_use_id: "toolu_abc"
+  Sub-agent: stream_event { event: content_block_delta }          parent_tool_use_id: "toolu_abc"
+  Sub-agent: stream_event { event: content_block_stop }           parent_tool_use_id: "toolu_abc"
+  Sub-agent: stream_event { event: message_stop }                 parent_tool_use_id: "toolu_abc"
+  Sub-agent: assistant { message: { content: [...] } }            parent_tool_use_id: "toolu_abc"
+  Sub-agent: user { tool_use_result: {...} }                      parent_tool_use_id: "toolu_abc"
+  ... (more sub-agent turns) ...
+Top-level: stream_event { event: message_start }                  parent_tool_use_id: null
+Top-level: stream_event { event: content_block_start, text }      parent_tool_use_id: null
+...
+result { subtype: "success" }
+```
+
+Today, **all lines where `parent_tool_use_id` is truthy are silently dropped** (line 238 of `provider.ts`). This is correct for break-early scoping but means zero sub-agent visibility.
+
+## New Architecture (What to Build)
+
+### Feature 1: Sub-Agent Progress Visibility (#12)
+
+#### Integration Strategy
+
+Inject sub-agent progress as **text_delta events** into pi's stream. This is the path of least resistance because:
+- pi's `AssistantMessageEventStream` has a fixed event type vocabulary (`start`, `text_*`, `thinking_*`, `toolcall_*`, `done`, `error`)
+- There is no "annotation" or "progress" event type in pi's API
+- Emitting sub-agent activity as formatted text deltas makes it visible to the user in any pi renderer without pi-side changes
+
+#### Data Flow: Sub-Agent Progress
+
+```
+rl.on("line") callback
+    |
+    +-- msg.type === "stream_event" && parent_tool_use_id is truthy
+    |       |
+    |       +-- Extract progress info from sub-agent event
+    |       |   - content_block_start + tool_use --> "Using {tool_name}..."
+    |       |   - content_block_start + text --> (sub-agent is responding)
+    |       |   - content_block_stop (for tool_use) --> "Done with {tool_name}"
+    |       |
+    |       +-- progressEmitter.emit(toolName, status)
+    |               |
+    |               v
+    |           Debounce/throttle (avoid flooding pi stream)
+    |               |
+    |               v
+    |           Inject into event bridge as text_delta
+    |           OR: emit as a separate "status" line before the final text
+    |
+    +-- msg.type === "assistant" && parent_tool_use_id is truthy
+            |
+            +-- Extract completed turn summary
+            +-- Optional: emit as progress text
+```
+
+#### Recommended Pattern: Synthetic Text Block
+
+The cleanest approach is a dedicated progress handler that:
+
+1. Tracks sub-agent state (which agent, what tools it's using)
+2. Emits progress as a synthetic text block prepended to the response
+3. Replaces the text block content on each update (not appended, to avoid noise)
+
+**However**, pi's streaming model is append-only -- there is no "replace" event. So progress must either:
+
+- **Option A: Prepend a progress text block** that gets `text_end`'d before the real response starts. Pi renders it, then the real response follows. User sees: `"[Agent: reading src/provider.ts...]\n\nHere's what I found..."`. Clean, simple, no pi changes needed.
+- **Option B: Emit progress as thinking deltas** inside a thinking block. Pi renders these in a collapsible thinking section. Less noisy but only works if the model supports thinking.
+- **Option C: Log to console only** (`console.log`). Visible in terminal but not in pi's UI.
+
+**Recommendation: Option A** -- synthetic text block for progress, closed before the real response text block starts.
+
+#### Component: SubAgentTracker
+
+New file: `src/subagent-tracker.ts`
+
+```
+Responsibilities:
+- Track active sub-agent tool executions by parent_tool_use_id
+- Extract tool names from sub-agent stream events
+- Debounce/batch progress updates
+- Provide formatted progress strings
+- Interface with event bridge to emit synthetic text blocks
+
+State:
+- activeAgents: Map<string, { toolName: string, currentTool?: string, startTime: number }>
+- progressBlock: { index: number, text: string } | null
+```
+
+#### Integration Point in provider.ts
+
+The sub-agent tracking hooks into the existing `rl.on("line")` handler at the point where non-top-level events are currently dropped:
+
+```typescript
+// Current code (provider.ts:235-241):
+if (msg.type === "stream_event") {
+  const isTopLevel = !(msg as any).parent_tool_use_id;
+  if (isTopLevel) {
+    bridge.handleEvent(msg.event);
+  }
+  // ... break-early logic for top-level only
+}
+
+// New code adds an else branch:
+if (msg.type === "stream_event") {
+  const isTopLevel = !(msg as any).parent_tool_use_id;
+  if (isTopLevel) {
+    bridge.handleEvent(msg.event);
+  } else {
+    // NEW: Track sub-agent progress
+    subAgentTracker.handleEvent(msg.event, (msg as any).parent_tool_use_id);
+  }
+  // ... break-early logic unchanged (still top-level only)
+}
+```
+
+#### Critical Constraint: Timing of Progress Block
+
+The progress text block MUST be closed (`text_end`) before the first top-level `content_block_start` event arrives. Otherwise the content indices will be wrong. This means:
+
+1. Open progress text block when first sub-agent event arrives
+2. Append tool progress as deltas
+3. Close progress text block on first top-level `content_block_start` (or on result)
+4. Event bridge then handles top-level content blocks normally
+
+This timing works naturally because the CLI processes sub-agent turns first, then emits the final top-level response.
+
+### Feature 2: Actionable CLI Error Passthrough (#2)
+
+#### Error Sources
+
+Actionable CLI errors can surface in three places in the NDJSON stream:
+
+| Source | NDJSON Message | Field | Value | Examples |
+|--------|---------------|-------|-------|----------|
+| API error during streaming | `assistant` | `error` | `"invalid_request"`, `"rate_limit"`, `"authentication_failed"`, `"billing_error"`, `"server_error"` | Context overflow, 5-hr subscription cap, auth expired |
+| Final result error | `result` | `subtype` | `"error_during_execution"`, `"error_max_turns"`, `"error_max_budget_usd"` | Max turns hit, budget exceeded |
+| Subprocess stderr | stderr buffer | N/A | Contains error text | CLI crash, unhandled errors |
+
+#### Data Flow: Error Detection and Passthrough
+
+```
+rl.on("line") callback
+    |
+    +-- msg.type === "assistant"
+    |       |
+    |       +-- msg.error is truthy?
+    |       |       |
+    |       |       +-- YES: endStreamWithError(formatAssistantError(msg))
+    |       |       |   Maps: "invalid_request" --> "Context limit exceeded..."
+    |       |       |   Maps: "rate_limit" --> "Rate limit or subscription cap reached..."
+    |       |       |   Maps: "authentication_failed" --> "Authentication failed..."
+    |       |       |   Maps: "billing_error" --> "Billing/subscription error..."
+    |       |       |   Maps: "server_error" --> "Claude API server error..."
+    |       |       |
+    |       |       +-- NO: ignore (normal assistant turn, handled via stream_events)
+    |       |
+    |       +-- parent_tool_use_id? --> sub-agent error, handle differently
+    |
+    +-- msg.type === "result"
+    |       |
+    |       +-- msg.is_error === true OR msg.subtype !== "success"
+    |       |       |
+    |       |       +-- "error_during_execution" --> endStreamWithError(msg.result or msg.error)
+    |       |       +-- "error_max_turns" --> endStreamWithError("Max turns exceeded")
+    |       |       +-- Other error subtypes --> endStreamWithError(msg.error)
+    |       |
+    |       +-- Current check: msg.subtype === "error" (TOO NARROW)
+    |           Need to widen to catch all error subtypes
+    |
+    +-- proc.on("close") handler (existing)
+            |
+            +-- Already handles stderr surface for non-zero exit codes
+            +-- Context errors may appear here if CLI crashes
+```
+
+#### Integration Point in provider.ts
+
+Two changes to the line handler:
+
+**1. Add `assistant` message handling (new branch):**
+
+```typescript
+} else if (msg.type === "assistant") {
+  const error = (msg as any).message?.error || (msg as any).error;
+  if (error) {
+    // Only handle top-level errors; sub-agent errors are internal
+    const isTopLevel = !(msg as any).parent_tool_use_id;
+    if (isTopLevel) {
+      endStreamWithError(formatAssistantError(error));
+    }
   }
 }
 ```
 
-**Extension writes to stdin -- control_response (deny):**
-```json
-{
-  "type": "control_response",
-  "request_id": "req_1_abc123",
-  "response": {
-    "subtype": "success",
-    "response": { "behavior": "deny" }
+**2. Fix `result` error detection (modify existing branch):**
+
+```typescript
+// Current (too narrow):
+} else if (msg.type === "result") {
+  if (msg.subtype === "error") {
+    endStreamWithError(msg.error ?? "Unknown error from Claude CLI");
+  }
+  // ...
+}
+
+// Fixed (catches all error subtypes):
+} else if (msg.type === "result") {
+  if (msg.subtype !== "success") {
+    const errorMsg = (msg as any).result
+      ?? (msg as any).error
+      ?? `Claude CLI error: ${msg.subtype}`;
+    endStreamWithError(errorMsg);
+  }
+  // ...
+}
+```
+
+#### Error Message Formatting
+
+New utility function (can live in `provider.ts` or a new `error-formatter.ts`):
+
+```typescript
+function formatAssistantError(error: string): string {
+  switch (error) {
+    case "invalid_request":
+      return "Context limit exceeded: conversation is too long. Start a new session or reduce context.";
+    case "rate_limit":
+      return "Rate limit or subscription usage cap reached. Wait for the current window to reset, or check your subscription tier.";
+    case "authentication_failed":
+      return "Authentication failed. Run 'claude auth login' to re-authenticate.";
+    case "billing_error":
+      return "Billing or subscription error. Check your Claude subscription status.";
+    case "server_error":
+      return "Claude API server error. Please retry.";
+    default:
+      return `Claude API error: ${error}`;
   }
 }
 ```
 
-**Extension writes to stdin -- control_response (allow MCP tool):**
-```json
-{
-  "type": "control_response",
-  "request_id": "req_1_abc123",
-  "response": {
-    "subtype": "success",
-    "response": { "behavior": "allow" }
-  }
+### Feature 3: README Update (#3)
+
+Documentation-only change. No architecture impact.
+
+## Type Changes Required
+
+### New Types in types.ts
+
+```typescript
+// Add to NdjsonMessage union:
+export interface ClaudeAssistantMessage {
+  type: "assistant";
+  message?: {
+    content?: unknown[];
+    model?: string;
+    stop_reason?: string;
+    usage?: ClaudeUsage;
+  };
+  error?: string; // AssistantMessageError literal
+  parent_tool_use_id?: string | null;
+  uuid?: string;
+  session_id?: string;
+}
+
+export interface ClaudeUserMessage {
+  type: "user";
+  content?: unknown;
+  tool_use_result?: unknown;
+  parent_tool_use_id?: string | null;
+}
+
+// Update NdjsonMessage union:
+export type NdjsonMessage =
+  | ClaudeStreamEventMessage
+  | ClaudeResultMessage
+  | ClaudeSystemMessage
+  | ClaudeControlRequest
+  | ClaudeAssistantMessage
+  | ClaudeUserMessage;
+
+// Update ClaudeResultMessage:
+export interface ClaudeResultMessage {
+  type: "result";
+  subtype: "success" | "error_max_turns" | "error_max_budget_usd" | "error_during_execution" | string;
+  result?: string;
+  error?: string;
+  is_error?: boolean;
+  session_id?: string;
+  total_cost_usd?: number;
+  usage?: ClaudeUsage;
+}
+
+// Update ClaudeStreamEventMessage to include parent_tool_use_id:
+export interface ClaudeStreamEventMessage {
+  type: "stream_event";
+  event: ClaudeApiEvent;
+  parent_tool_use_id?: string | null;
+  uuid?: string;
+  session_id?: string;
 }
 ```
 
-### Tool Name Mapping (Bidirectional)
+## Component Responsibilities (Updated)
 
-| Claude Built-in | pi Equivalent | Arg Translations |
-|----------------|---------------|------------------|
-| `Read` | `read` | `file_path` <-> `path` |
-| `Write` | `write` | `file_path` <-> `path`, `content` <-> `content` |
-| `Edit` | `edit` | `file_path` <-> `path`, `old_string` <-> `oldText`, `new_string` <-> `newText` |
-| `Bash` | `bash` | `command` <-> `command` |
-| `Grep` | `grep` | `pattern` <-> `pattern`, `path` <-> `path` |
-| `Glob` | `find` | `pattern` <-> `pattern`, `path` <-> `path` |
+| Component | Current Responsibility | New Responsibility |
+|-----------|----------------------|-------------------|
+| `provider.ts` | Orchestrate subprocess, route NDJSON by type, break-early | + Handle `assistant` errors, fix `result` error detection, integrate sub-agent tracker |
+| `event-bridge.ts` | Map Claude API events to pi stream events | **NO CHANGES** -- progress block injection happens in provider |
+| `stream-parser.ts` | Parse NDJSON lines | **NO CHANGES** -- already returns any valid JSON object |
+| `types.ts` | Type definitions for NDJSON protocol | + Add `ClaudeAssistantMessage`, update `ClaudeResultMessage` subtypes, add `parent_tool_use_id` to `ClaudeStreamEventMessage` |
+| `subagent-tracker.ts` | **NEW** | Track sub-agent state, emit progress text to pi stream |
+| `control-handler.ts` | Handle permission control requests | **NO CHANGES** |
+| `tool-mapping.ts` | Bidirectional tool name/arg mapping | **NO CHANGES** |
+| `process-manager.ts` | Subprocess lifecycle | **NO CHANGES** |
 
-Confidence: MEDIUM -- mapping details inferred from reference project README and pi extension docs. The exact argument field names should be verified against current pi and Claude CLI versions at implementation time.
+## Build Order (Dependency-Aware)
 
-### Custom Tool MCP Proxy Flow
+### Phase 1: Type Foundation
+1. Update `types.ts` with new/updated NDJSON message types
+2. Add `parent_tool_use_id` to `ClaudeStreamEventMessage`
+3. Update `ClaudeResultMessage` subtypes
 
-```
-1. On extension load:
-   - Enumerate pi's registered custom tools via pi.getAllTools()
-   - Filter out built-in tools (read, write, edit, bash, grep, find)
-   - If custom tools exist, create an MCP tool proxy
+**Rationale:** All subsequent work depends on accurate types. Zero risk, pure additive.
 
-2. McpToolProxy creates a stdio MCP server process
-   - Listens on stdin, responds on stdout (MCP JSON-RPC protocol)
-   - Implements tools/list handler: returns custom tool definitions
-   - Implements tools/call handler: receives call, returns denied/error
-     (Claude proposes the call, pi actually executes it --
-      the proxy only needs to expose tool schemas so Claude knows
-      the tools exist; execution is blocked via control_request denial
-      and the tool_call event is forwarded to pi for execution)
+### Phase 2: Context Limit Error Passthrough (#2)
+1. Add `assistant` message handling branch in `provider.ts` line handler
+2. Add `formatAssistantError()` utility
+3. Fix `result` error detection (widen from `subtype === "error"` to `subtype !== "success"`)
+4. Add tests for each error type
 
-3. ProcessManager writes a temp mcp-config.json:
-   {
-     "mcpServers": {
-       "custom-tools": {
-         "type": "stdio",
-         "command": "node",
-         "args": ["path/to/mcp-proxy.js"]
-       }
-     }
-   }
+**Rationale:** Simpler feature, no new files, low risk. Gets the error plumbing right before adding progress complexity. Also validates that the `assistant` message type appears in practice.
 
-4. claude -p is spawned with --mcp-config <temp-config>
-   - Claude discovers mcp__custom-tools__<toolName> tools
-   - When Claude proposes using one, control_request fires
-   - ToolRouter allows mcp__ prefixed tools (Claude executes them via MCP)
+### Phase 3: Sub-Agent Progress (#12)
+1. Create `subagent-tracker.ts` with state tracking and progress formatting
+2. Wire tracker into provider's line handler (else branch for non-top-level events)
+3. Implement synthetic progress text block injection
+4. Handle progress block lifecycle (open on first sub-agent event, close before top-level content)
+5. Add tests with realistic sub-agent event sequences
 
-   ALTERNATIVE APPROACH (simpler):
-   - The MCP proxy returns tool results directly from pi's tool execution
-   - Instead of allowing the control_request AND having pi execute separately,
-     the proxy intercepts the MCP call, delegates to pi's tool executor,
-     and returns the result through MCP -- making it transparent to Claude
-```
+**Rationale:** Depends on Phase 1 types. More complex, benefits from the error handling plumbing already being solid.
 
-**Confidence note on MCP proxy:** The reference project uses the SDK's `createSdkMcpServer()` which handles this transparently. Without the SDK, we need to implement an equivalent. Two viable approaches exist (detailed above). The simpler approach -- where the MCP proxy server calls pi's tool executor and returns results via MCP -- avoids complex coordination between MCP allow/deny and pi's separate tool execution. This is a key architectural decision to resolve in Phase 1.
-
-## Component Details
-
-### ExtensionEntry (`index.ts`)
-
-The entry point exports a default function receiving `ExtensionAPI`. Responsibilities:
-
-```typescript
-export default function(pi: ExtensionAPI) {
-  // 1. Get available Claude models
-  const models = getModels("anthropic"); // or hardcoded list
-
-  // 2. Register as custom provider
-  pi.registerProvider("claude-cli", {
-    streamSimple: (model, context, options) => {
-      return streamViaCli(model, context, options, pi);
-    },
-    models: [
-      {
-        id: "claude-opus-4-6",
-        name: "Claude Opus 4.6",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
-        contextWindow: 200000,
-        maxTokens: 32000,
-      },
-      // ... other models
-    ],
-  });
-}
-```
-
-### PromptBuilder
-
-Converts pi's conversation context into a single prompt string. The stateless model means every request replays the full conversation.
-
-Key considerations:
-- Messages are role-tagged: `USER:`, `ASSISTANT:`, `TOOL RESULT [name]:`
-- Tool call proposals from the assistant are included so Claude sees its own prior reasoning
-- System prompt from pi context may be appended via `--append-system-prompt` or embedded in the prompt
-- Image content blocks need special handling (Claude CLI supports image inputs but the encoding/format needs validation)
-
-### ProcessManager
-
-Manages the `child_process.spawn()` lifecycle:
-
-```typescript
-// Spawn args construction
-const args = [
-  "-p", prompt,
-  "--input-format", "stream-json",
-  "--output-format", "stream-json",
-  "--verbose",
-  "--include-partial-messages",
-  "--model", model.id,
-];
-
-if (mcpConfigPath) {
-  args.push("--mcp-config", mcpConfigPath);
-}
-
-if (!strictMcpConfig) {
-  // Don't add --strict-mcp-config, let .mcp.json load
-} else {
-  args.push("--strict-mcp-config");
-}
-
-const proc = spawn("claude", args, {
-  stdio: ["pipe", "pipe", "pipe"],
-  // Windows: shell: true may be needed
-});
-```
-
-Platform considerations:
-- **Windows:** May need `shell: true` or explicit `.cmd` extension for the `claude` command
-- **AbortSignal:** Must handle `options?.signal` from pi to kill the subprocess on cancellation
-- **stderr:** Capture for error reporting but do not parse as protocol data
-
-### StreamParser
-
-Reads stdout line-by-line, parsing each as JSON:
-
-```typescript
-// Pseudocode
-for await (const line of readLines(proc.stdout)) {
-  const msg = JSON.parse(line);
-
-  if (msg.type === "stream_event") {
-    eventBridge.handleStreamEvent(msg.event);
-  } else if (msg.type === "control_request") {
-    toolRouter.handleControlRequest(msg, proc.stdin);
-  }
-  // Ignore other message types (system, result, etc.)
-}
-```
-
-The `--verbose` and `--include-partial-messages` flags are critical -- without them, stream_event messages with granular content_block_delta events are not emitted.
-
-### EventBridge
-
-The core translation layer. Maintains state for:
-- Current `AssistantMessage` being built (the `partial` object)
-- Content block index tracking (maps Claude's content indices to pi's)
-- Usage accumulation (input/output/cache tokens)
-
-State machine per content block:
-```
-content_block_start(type=text)      -> push text_start
-content_block_delta(text_delta)     -> push text_delta (repeatable)
-content_block_stop                  -> push text_end
-
-content_block_start(type=tool_use)  -> push toolcall_start (with mapped name)
-content_block_delta(input_json_delta) -> push toolcall_delta (accumulate JSON)
-content_block_stop                  -> push toolcall_end (with parsed args, mapped)
-
-content_block_start(type=thinking)  -> push thinking_start
-content_block_delta(thinking_delta) -> push thinking_delta
-content_block_stop                  -> push thinking_end
-```
-
-### ToolRouter
-
-Simple decision logic, but critical for correctness:
-
-```typescript
-function shouldAllowTool(toolName: string): boolean {
-  // MCP tools are executed by Claude via the MCP server -- allow them
-  if (toolName.startsWith("mcp__")) return true;
-
-  // Built-in tools are denied -- pi executes them natively
-  // The denied tool_use is surfaced as a toolcall event to pi
-  return false;
-}
-```
-
-When a tool is denied:
-1. Write `control_response` with `behavior: "deny"` to subprocess stdin
-2. The EventBridge has already captured the tool_use content block from the stream
-3. Pi receives the `toolcall_start/delta/end` events and executes the tool itself
-4. The tool result gets included in the NEXT `streamSimple` call's context (since sessions are stateless)
-
-### ToolMapper
-
-Stateless bidirectional mapping. Two functions:
-
-```typescript
-// Claude -> pi (outbound: when Claude proposes a tool call)
-function mapToolCallToPi(claudeName: string, claudeArgs: Record<string, any>)
-  : { name: string; args: Record<string, any> }
-
-// pi -> Claude (inbound: when building prompt with prior tool results)
-function mapToolResultToClaude(piName: string, piArgs: Record<string, any>)
-  : { name: string; args: Record<string, any> }
-```
-
-### McpToolProxy
-
-The most architecturally significant new component (not in the SDK path). Two implementation approaches:
-
-**Approach A: Schema-only proxy (simpler, recommended first)**
-- MCP server exposes tool schemas from `pi.getAllTools()` minus built-ins
-- `tools/call` handler returns an error/empty result (tool is never actually called via MCP)
-- Claude knows the tools exist (proposes them), but execution is denied via control_request
-- Pi executes the tool natively when it receives the toolcall event
-- Problem: Claude may get confused by MCP tool call failures if it expects a result
-
-**Approach B: Delegating proxy (more complex, likely needed)**
-- MCP server exposes tool schemas from `pi.getAllTools()`
-- `tools/call` handler delegates to pi's tool execution (via extension API or direct invocation)
-- Returns the real tool result through MCP to Claude
-- Control_request for `mcp__` tools is allowed (Claude calls them via MCP)
-- Pi does NOT separately execute these tools (avoids double execution)
-- Requires a way to invoke pi tool execution from within the MCP server process
-
-**Recommendation:** Start with Approach A for simplicity. If Claude's behavior is degraded by denied MCP tool calls, switch to Approach B.
-
-## Patterns to Follow
-
-### Pattern 1: Stateless Subprocess per Request
-**What:** Spawn a fresh `claude -p` process for each `streamSimple` call with full conversation history replayed
-**When:** Every LLM turn
-**Why:** Matches reference project pattern. Avoids session state complexity. Each call is independent.
-
-```typescript
-// Each streamSimple call is a fresh subprocess
-function streamViaCli(model, context, options, pi) {
-  const stream = createAssistantMessageEventStream();
-
-  (async () => {
-    const prompt = buildPrompt(context);
-    const proc = spawnClaude(model, prompt, options);
-
-    // Parse and bridge events...
-
-    proc.on("exit", () => stream.end());
-  })();
-
-  return stream;
-}
-```
-
-### Pattern 2: NDJSON Line-Delimited Parsing
-**What:** Read subprocess stdout as newline-delimited JSON, one complete object per line
-**When:** All subprocess communication
-**Why:** The stream-json protocol guarantees one JSON object per line.
-
-```typescript
-import { createInterface } from "node:readline";
-
-const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
-for await (const line of rl) {
-  if (line.trim()) {
-    const msg = JSON.parse(line);
-    // handle msg...
-  }
-}
-```
-
-### Pattern 3: Event Stream State Machine
-**What:** Track content block state to correctly sequence pi events
-**When:** Translating Claude API events to pi events
-**Why:** Claude API events are indexed by content block; pi expects sequential start/delta/end groups.
-
-### Pattern 4: Graceful Subprocess Cleanup
-**What:** Kill subprocess on abort signal, handle unexpected exits
-**When:** Cancellation, errors, timeouts
-**Why:** Orphaned processes leak resources.
-
-```typescript
-options?.signal?.addEventListener("abort", () => {
-  proc.kill("SIGTERM");
-});
-
-proc.on("error", (err) => {
-  stream.push({ type: "error", reason: "error", error: output });
-  stream.end();
-});
-```
+### Phase 4: README Update (#3)
+1. Update README with install instructions
+2. Independent of other phases
 
 ## Anti-Patterns to Avoid
 
-### Anti-Pattern 1: Persistent Subprocess Sessions
-**What:** Keeping a claude subprocess alive across multiple `streamSimple` calls
-**Why bad:** The stream-json input mode supports persistent sessions, but this adds significant complexity: session state management, reconnection on crash, prompt deduplication, and the reference project doesn't use it. Risk of subtle state corruption bugs.
-**Instead:** Stateless subprocess per request. Accept the token cost of replaying history.
+### Anti-Pattern 1: Modifying event-bridge.ts for Progress
 
-### Anti-Pattern 2: Parsing stderr as Protocol Data
-**What:** Treating subprocess stderr output as NDJSON protocol messages
-**Why bad:** stderr contains diagnostic output, warnings, and error messages -- not structured protocol data
-**Instead:** Log stderr for debugging, only parse stdout as NDJSON protocol
+**What people do:** Add progress event handling inside `createEventBridge()`.
+**Why it's wrong:** The event bridge has a clean abstraction boundary -- it maps Claude API events 1:1 to pi events. Progress is synthetic (not from Claude API). Mixing synthetic and real events in the bridge makes it harder to reason about.
+**Do this instead:** Handle progress in `provider.ts` by directly calling `stream.push()` for the synthetic text block, before the bridge handles real content blocks.
 
-### Anti-Pattern 3: Synchronous Subprocess Communication
-**What:** Using `execSync` or blocking reads for subprocess I/O
-**Why bad:** Blocks the Node.js event loop, prevents streaming, breaks pi's real-time token display
-**Instead:** Async spawn with piped stdio, readline interface for line-by-line processing
+### Anti-Pattern 2: Forwarding All Sub-Agent Events to Pi
 
-### Anti-Pattern 4: Hardcoded Tool Mappings Without Validation
-**What:** Assuming tool name/argument mappings are static and never change
-**Why bad:** Both pi and Claude CLI evolve independently; tool names or argument schemas may change
-**Instead:** Define mappings as configuration objects, log warnings on unknown tools, fail gracefully
+**What people do:** Remove the `isTopLevel` filter and forward everything.
+**Why it's wrong:** Sub-agent events have their own `message_start`/`message_stop` lifecycle. Forwarding them to the event bridge would corrupt the bridge's block index tracking and interfere with break-early. The bridge assumes a single message lifecycle.
+**Do this instead:** Extract only the progress information from sub-agent events (tool names, completion status) and inject it as synthetic progress text.
 
-### Anti-Pattern 5: Double Tool Execution
-**What:** Both allowing an MCP tool call AND having pi execute the same tool
-**Why bad:** Tool runs twice, potentially with side effects (e.g., writing a file twice)
-**Instead:** Either the MCP proxy handles execution (allow in control_request) OR pi handles it (deny in control_request), never both
+### Anti-Pattern 3: String-Matching Stderr for Error Detection
 
-## Scalability Considerations
+**What people do:** Parse stderr output with regex to detect "Prompt is too long" or "context limit".
+**Why it's wrong:** Fragile, locale-dependent, and races with the structured NDJSON error messages that the CLI already provides.
+**Do this instead:** Use the structured `assistant.error` and `result.subtype`/`result.is_error` fields. Stderr is a fallback already handled by the `proc.on("close")` handler for non-zero exit codes.
 
-| Concern | At MVP | At Production | Notes |
-|---------|--------|---------------|-------|
-| Subprocess overhead | 1 process per turn, ~50KB tokens replayed | Same (stateless is the model) | Token cost is the subscription cost, not API billing |
-| Process cleanup | Kill on abort | Kill on abort + timeout watchdog | Prevent orphaned processes on crashes |
-| MCP proxy lifecycle | Start/stop per subprocess | Cache proxy process, reuse across calls | MCP server startup has latency |
-| Tool mapping | 6 hardcoded mappings | Configurable mapping table | Pi may add/rename tools |
-| Platform compat | Test on one OS | Windows + macOS + Linux testing | `spawn` behavior differs, especially `shell: true` on Windows |
-| Error recovery | Log and surface error event | Retry logic, fallback to error state | Subprocess may crash mid-stream |
+### Anti-Pattern 4: Holding Sub-Agent Events in a Buffer
 
-## Suggested Build Order (Dependencies)
+**What people do:** Buffer all sub-agent events and replay them after the sub-agent finishes.
+**Why it's wrong:** Defeats the purpose of real-time progress. Sub-agent execution can take minutes. The whole point is to show progress as it happens.
+**Do this instead:** Emit progress text deltas as sub-agent events arrive, using a debounce to avoid flooding.
 
-Build order is driven by component dependencies. Each phase depends on the previous.
+## Key Risks and Mitigations
 
-### Phase 1: Core Subprocess Bridge (foundational)
-**Components:** ExtensionEntry, ProcessManager, StreamParser (text-only), EventBridge (text events only)
-**Delivers:** Extension registers as provider, spawns subprocess, streams text responses back to pi
-**Why first:** Everything else builds on the ability to spawn and communicate with the subprocess
-**Validates:** Stream-json protocol works, pi provider registration works, basic streaming works
-
-### Phase 2: Tool Denial and Mapping
-**Components:** ToolRouter, ToolMapper, EventBridge (add toolcall events)
-**Delivers:** Claude proposes tools, extension denies built-in tools, pi receives mapped tool_call events and executes them
-**Why second:** Tool handling is the core value proposition -- without it, Claude has no tools
-**Validates:** Control protocol works, tool name/arg mapping is correct, pi executes tools from Claude's proposals
-
-### Phase 3: Extended Thinking and Usage
-**Components:** EventBridge (add thinking events), usage tracking, cost calculation
-**Delivers:** Thinking tokens stream to pi, usage/cost metrics are accurate
-**Why third:** Thinking support requires the streaming infrastructure from Phase 1-2 but is independent of tool handling
-**Validates:** Thinking content blocks parse correctly, usage accumulation works
-
-### Phase 4: Custom Tool MCP Proxy
-**Components:** McpToolProxy
-**Delivers:** Pi's custom-registered tools are visible to Claude and can be called
-**Why fourth:** This is the most complex new component. Requires the control protocol (Phase 2) to work correctly first
-**Validates:** MCP server spawns correctly, Claude discovers custom tools, tool calls route correctly
-
-### Phase 5: Platform Hardening
-**Components:** Cross-platform subprocess handling, error recovery, edge cases
-**Delivers:** Works on Windows/macOS/Linux, handles crashes gracefully, proper cleanup
-**Why last:** Correctness and robustness polish after core functionality is proven
-
-```
-Phase 1: ExtensionEntry + ProcessManager + StreamParser + EventBridge(text)
-    |
-    v
-Phase 2: ToolRouter + ToolMapper + EventBridge(toolcall)
-    |
-    v
-Phase 3: EventBridge(thinking) + Usage tracking
-    |
-    v
-Phase 4: McpToolProxy
-    |
-    v
-Phase 5: Platform hardening + error recovery
-```
-
-## Key Architectural Decisions to Resolve
-
-| Decision | Options | Recommendation | Confidence |
-|----------|---------|----------------|------------|
-| Prompt format | Flattened text vs structured messages | Flattened text (matches reference project) | HIGH -- reference project validates this |
-| MCP proxy approach | Schema-only vs delegating proxy | Start with schema-only (Approach A), upgrade if needed | MEDIUM -- depends on Claude's behavior when MCP tools are denied |
-| System prompt handling | `--append-system-prompt` flag vs embedded in prompt | `--append-system-prompt` flag (cleaner separation) | MEDIUM -- needs testing |
-| Windows subprocess | `spawn("claude", ...)` vs `spawn("claude.cmd", ...)` | Detect platform, use `.cmd` on Windows or `shell: true` | HIGH -- standard Node.js pattern |
-| MCP config persistence | Temp file per request vs persistent config | Temp file per request (stateless model, clean up after) | HIGH -- matches stateless subprocess pattern |
-| Image content handling | Base64 in prompt vs file reference | Needs investigation -- unclear if `claude -p` accepts images in stream-json input | LOW -- requires experimentation |
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|------------|
+| `assistant` message type not actually emitted in `-p` mode with `--include-partial-messages` | LOW | Phase 2 error detection falls back to `result` + stderr | Test with real CLI. The `result` error path already exists as fallback. |
+| Progress text block indices conflict with real content blocks | MEDIUM | Garbled output in pi | Close progress block before first top-level `content_block_start`. Integration test with realistic event sequences. |
+| Sub-agent events arrive after top-level response starts (interleaved) | LOW | Progress appears mid-response text | The CLI processes sub-agents to completion before emitting the top-level response. Verify with real traces. |
+| `result.subtype` values differ from documented SDK spec | LOW | Some errors not caught | Use `is_error` boolean as secondary check alongside `subtype !== "success"` |
 
 ## Sources
 
-- [pi custom-provider docs](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/custom-provider.md) -- HIGH confidence, official documentation
-- [pi extensions docs](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md) -- HIGH confidence, official documentation
-- [claude-agent-sdk-pi reference project](https://github.com/prateekmedia/claude-agent-sdk-pi) -- HIGH confidence, proven implementation
-- [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference) -- HIGH confidence, official documentation
-- [Claude Agent SDK streaming output](https://platform.claude.com/docs/en/agent-sdk/streaming-output) -- HIGH confidence, official documentation
-- [Claude Agent SDK custom tools](https://platform.claude.com/docs/en/agent-sdk/custom-tools) -- HIGH confidence, official documentation
-- [Inside the Claude Agent SDK (substack)](https://buildwithaws.substack.com/p/inside-the-claude-agent-sdk-from) -- MEDIUM confidence, reverse-engineered protocol details
-- [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) -- HIGH confidence, official MCP implementation
+- [Claude Code CLI Reference](https://code.claude.com/docs/en/cli-reference) -- CLI flags and output format options (HIGH confidence)
+- [Agent SDK Streaming Output](https://platform.claude.com/docs/en/agent-sdk/streaming-output) -- StreamEvent reference, parent_tool_use_id, message flow (HIGH confidence)
+- [Agent SDK Agent Loop](https://platform.claude.com/docs/en/agent-sdk/agent-loop) -- Message types, ResultMessage subtypes, error handling, compaction (HIGH confidence)
+- [Agent SDK Python Reference](https://platform.claude.com/docs/en/agent-sdk/python) -- AssistantMessageError type definition (HIGH confidence)
+- [NDJSON Wire Protocol Spec (community gist)](https://gist.github.com/POWERFULMOVES/58bcadab9483bf5e633e865f131e6c25) -- Result subtypes, assistant error field (MEDIUM confidence)
+- [pi Custom Provider Documentation](https://github.com/badlogic/pi-mono) -- AssistantMessageEventStream event types, stream pattern (HIGH confidence, verified in node_modules)
+- Codebase verification of `provider.ts`, `event-bridge.ts`, `types.ts`, `stream-parser.ts` -- current architecture (HIGH confidence)
+
+---
+*Architecture research for: pi-claude-cli v0.4.0 observability integration*
+*Researched: 2026-03-21*

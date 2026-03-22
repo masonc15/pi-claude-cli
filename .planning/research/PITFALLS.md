@@ -1,336 +1,302 @@
-# Domain Pitfalls
+# Pitfalls Research
 
-**Domain:** CLI subprocess integration bridging streaming protocols (Claude CLI to pi coding agent)
-**Researched:** 2026-03-13
+**Domain:** Adding observability (sub-agent progress, error passthrough) to existing Claude CLI subprocess bridge
+**Researched:** 2026-03-21
+**Confidence:** HIGH (based on codebase analysis, Claude CLI docs, known Node.js behaviors, and upstream bug reports)
 
 ## Critical Pitfalls
 
-Mistakes that cause rewrites, hangs, or render the extension unusable.
+### Pitfall 1: Sub-Agent Events Break the Break-Early Guard
 
-### Pitfall 1: Claude CLI Process Never Exits After Completion (stream-json hang)
+**What goes wrong:**
+When forwarding sub-agent events (those with `parent_tool_use_id` set), the progress handler accidentally triggers the break-early mechanism. Sub-agent `message_stop` events or sub-agent `content_block_start` with `type: "tool_use"` get treated as top-level events, causing the subprocess to be killed mid-operation. The user sees a partial response and the sub-agent work is lost.
 
-**What goes wrong:** After the Claude CLI subprocess successfully completes a task and emits a `{"type":"result","subtype":"success"}` event, the process does not exit. stdout remains open, the process stays alive indefinitely, and the parent never receives an `end` event on the stream. This is a known, documented bug in Claude Code (issues #25629, #21099, #3187).
+**Why it happens:**
+The current code in `provider.ts` filters sub-agent events using `!(msg as any).parent_tool_use_id` on the raw NDJSON message. When adding progress forwarding, the developer needs to both forward the event AND maintain the existing filter on break-early logic. It is easy to restructure the `if (isTopLevel)` block to forward sub-agent events and accidentally move the `sawBuiltInOrCustomTool = true` or `message_stop` handling outside the top-level guard.
 
-**Why it happens:** The CLI's stream-json mode does not close stdout or call `process.exit()` after sending the final result event. Internal timers, MCP servers, or pending promises keep the event loop alive. The process waits for more input on stdin even though the conversation is functionally complete.
+**How to avoid:**
+- Keep the break-early decision logic (`sawBuiltInOrCustomTool`, `message_stop` kill) strictly inside the existing `isTopLevel` guard. Never move it.
+- Create a separate code path for sub-agent progress forwarding that runs AFTER the break-early check, not inside it.
+- The pattern should be: `if (isTopLevel) { /* existing break-early logic */ } else if (parentToolUseId) { /* new progress forwarding */ }`.
+- Write a regression test that sends a sub-agent `message_stop` event and verifies the subprocess is NOT killed.
 
-**Consequences:** Every single request leaves an orphaned `claude` process consuming memory and CPU. Over a session, dozens of zombie processes accumulate. If using `for await` or `stream.on('end')` to detect completion, the handler never fires and the pi extension hangs forever.
+**Warning signs:**
+- Tests that use sub-agent tool_use blocks start killing the subprocess unexpectedly.
+- The extension works for simple text responses but crashes/truncates when Claude uses Agent/Task/Skill internally.
+- `broken` flag gets set during sub-agent execution, causing remaining lines to be silently dropped.
 
-**Prevention:**
-- Parse the stdout NDJSON stream and detect the `{"type":"result"}` event as the authoritative "conversation done" signal.
-- After receiving a result event, set a short grace period (e.g., 5 seconds) then forcefully kill the subprocess via `SIGKILL` (Windows: `taskkill /F /T /PID`).
-- Never rely on the child process exiting cleanly or stdout closing. Always implement a kill-after-result pattern.
-- Track all spawned child PIDs and implement cleanup on extension deactivation/disposal.
-
-**Detection:** Monitor for growing process count (`claude` processes in task manager), or set a maximum wall-clock timeout per request and alert when it fires.
-
-**Confidence:** HIGH -- documented in multiple GitHub issues with reproduction steps. The workaround (kill after result event) is recommended by issue reporters.
-
-**Phase relevance:** Must be addressed in the very first phase (core subprocess management). Getting this wrong makes everything else untestable.
-
----
-
-### Pitfall 2: NDJSON Lines Split Across Chunk Boundaries
-
-**What goes wrong:** Node.js `child.stdout` emits `data` events as raw Buffer chunks with no guarantee of alignment to newline boundaries. A single NDJSON line may be split across two or more chunks, or a single chunk may contain multiple complete lines plus a partial trailing line. Naively calling `JSON.parse()` on each chunk produces `SyntaxError: Unexpected end of JSON input` intermittently and unpredictably.
-
-**Why it happens:** OS pipe buffering delivers data in fixed-size blocks (typically 4KB-64KB depending on platform), not line-delimited units. Under load or with large tool outputs, this happens frequently.
-
-**Consequences:** Intermittent JSON parse errors that corrupt the stream state. Missing events (tool calls, text deltas) that produce garbled output in pi. Extremely hard to reproduce in testing because it depends on timing and output size.
-
-**Prevention:**
-- Use a line-splitting transform stream like `split2` (npm package) that buffers partial lines and only emits complete newline-terminated strings.
-- Pipe the child stdout through `split2` before any JSON parsing: `child.stdout.pipe(split2()).on('data', line => JSON.parse(line))`.
-- Alternatively, implement a manual line buffer: accumulate chunks, split on `\n`, keep the last incomplete fragment for the next chunk.
-- Wrap `JSON.parse()` in try/catch even after splitting -- malformed output from debug message leakage (see Pitfall 3) will still occur.
-
-**Detection:** Add error logging around JSON.parse calls. If you see occasional parse errors that "fix themselves" on retry, you have this bug.
-
-**Confidence:** HIGH -- this is a fundamental property of Node.js streams, well-documented across the ecosystem.
-
-**Phase relevance:** Core subprocess communication layer (Phase 1). Must be correct before any event bridging can work.
+**Phase to address:**
+Phase 1 (Sub-Agent Progress) -- this is the core risk of the entire feature.
 
 ---
 
-### Pitfall 3: Debug/Diagnostic Output Corrupting stdout JSON Stream
+### Pitfall 2: Readline Buffered Lines Fire After rl.close()
 
-**What goes wrong:** The Claude CLI binary sometimes writes non-JSON debug or diagnostic messages to stdout instead of stderr, even when `--output-format stream-json` and `--debug-to-stderr` flags are set. Examples include sandbox initialization messages like `[SandboxDebug] ...` appearing on stdout.
+**What goes wrong:**
+After the subprocess is killed (break-early) or `rl.close()` is called on the result message, buffered lines in Node.js readline's internal buffer continue to fire `'line'` events. If the progress handler pushes events to the pi stream after `stream.end()` has been called, it throws an "write after end" error or corrupts the stream state.
 
-**Why it happens:** A documented bug in Claude Code (issue #12007, #14442) where internal components (sandbox initialization, native binary wrappers) write to stdout before the stream-json formatter takes control. The `--debug-to-stderr` flag is not universally respected by all internal subsystems.
+**Why it happens:**
+This is a documented Node.js behavior (nodejs/node#22615). Calling `rl.close()` does not synchronously stop `'line'` events from firing. Lines already buffered internally will still emit. The existing codebase has a `broken` guard flag for this exact reason, but adding new event handlers for sub-agent progress creates a second code path that may not check the guard.
 
-**Consequences:** `JSON.parse()` throws on non-JSON lines, potentially crashing the extension or causing it to lose sync with the protocol state machine. This is particularly insidious because it may only happen on certain platforms (Linux with seccomp) or CLI versions.
+**How to avoid:**
+- Every new code path added to the `rl.on('line')` handler MUST check `if (broken) return;` at the top. The existing guard covers the main handler, but if you extract progress handling into a separate function, that function needs access to the guard.
+- Also check `streamEnded` before pushing any event to the pi stream from progress handlers.
+- Do NOT add separate `rl.on('line')` listeners. Keep a single listener and dispatch from there. Multiple listeners multiply the race window.
 
-**Prevention:**
-- After line-splitting (Pitfall 2), validate that each line starts with `{` before attempting `JSON.parse()`.
-- Skip/log non-JSON lines rather than crashing. Treat them as diagnostic noise.
-- Always capture stderr separately and log it for debugging, but do not mix it into the JSON parse pipeline.
-- Pin or document minimum Claude CLI versions and test across updates.
+**Warning signs:**
+- Intermittent "write after end" errors in test runs or production.
+- Events appearing in the stream after the `done` event.
+- Errors that only reproduce under load or with long sub-agent tool chains (more buffered lines).
 
-**Detection:** Search extension logs for "SyntaxError" or "Unexpected token" errors from the stdout parser. Any non-JSON line on stdout is a symptom.
-
-**Confidence:** HIGH -- documented in multiple Claude Code GitHub issues with specific reproduction details.
-
-**Phase relevance:** Core subprocess communication layer (Phase 1). The stdout parser must be resilient to this from day one.
-
----
-
-### Pitfall 4: Windows-Specific Subprocess Spawning Failures
-
-**What goes wrong:** On Windows, the `claude` command resolves to a `.cmd` batch file wrapper, not a native executable. `child_process.spawn('claude', [...args])` without `shell: true` fails silently or throws `ENOENT` because Windows cannot execute `.cmd` files directly. Additionally, stdin buffering on Windows differs from Unix -- data written to `child.stdin` may remain buffered in the Node.js layer and never reach the subprocess.
-
-**Why it happens:** Windows does not support Unix-style shebangs or direct execution of batch scripts. The npm-installed `claude` is a `.cmd` wrapper. Windows pipes also use different buffering semantics than Unix pipes.
-
-**Consequences:** Extension works on macOS/Linux during development but fails completely on Windows. If stdin buffering is the issue, the subprocess spawns but never receives the control_response, hanging on the first tool approval request. This exact bug was documented in the Claude Agent SDK Python (issue #208) where Windows stdin flush was missing.
-
-**Prevention:**
-- Always use `shell: true` in spawn options, or detect the platform and use `claude.cmd` on Windows explicitly.
-- Better: use `cross-spawn` npm package which handles `.cmd` resolution transparently.
-- After every `child.stdin.write()`, call `child.stdin.uncork()` or ensure the write completes by checking the return value and listening for `drain`.
-- Test on Windows early and often. Do not treat it as a "we'll fix it later" platform.
-
-**Detection:** Extension fails immediately on Windows with ENOENT or hangs during the first tool approval. Check `process.platform === 'win32'` code paths exist.
-
-**Confidence:** HIGH -- documented in Claude SDK issues (#208, #252, #771) and Node.js documentation. The PROJECT.md explicitly lists Windows as a required platform.
-
-**Phase relevance:** Must be addressed in Phase 1 (subprocess spawning). Cannot defer Windows support when the developer is on Windows.
+**Phase to address:**
+Phase 1 (Sub-Agent Progress) -- must be handled in the same PR that adds progress forwarding.
 
 ---
 
-### Pitfall 5: Bidirectional Stdin/Stdout Deadlock
+### Pitfall 3: Confusing Sub-Agent Text Content with Top-Level Response
 
-**What goes wrong:** The Claude CLI sends a `control_request` on stdout asking for tool approval, then blocks waiting for a `control_response` on stdin. Meanwhile, the parent process is stuck trying to write data to stdin but the write buffer is full because the child's stdout buffer is also full and unread. Both processes wait on each other -- classic deadlock.
+**What goes wrong:**
+Sub-agent events include `content_block_start` with `type: "text"` and `content_block_delta` with `type: "text_delta"` that look identical to top-level text blocks. If sub-agent text deltas are forwarded to pi's event bridge as regular text, they get appended to the assistant message content, corrupting the response. The user sees internal sub-agent reasoning mixed into the visible response.
 
-**Why it happens:** OS pipe buffers are finite (typically 64KB on Linux, 4KB on some Windows configurations). If the parent is not draining stdout fast enough (e.g., doing synchronous processing of each event before reading the next), the child's stdout buffer fills up. The child blocks on its next write. If the parent then tries to write to stdin, and the child is blocked so it cannot read stdin, both sides deadlock.
+**Why it happens:**
+The `parent_tool_use_id` field is on the outer NDJSON wrapper (`ClaudeStreamEventMessage`), not on the inner `event` object. When extracting just `msg.event` and passing it to the event bridge, the parent context is lost. The event bridge has no way to distinguish sub-agent text from top-level text because it only receives `ClaudeApiEvent` objects.
 
-**Consequences:** The extension freezes mid-request with no error. The Claude subprocess is alive but blocked. No timeout fires because both processes are technically still running. Requires process kill to recover.
+**How to avoid:**
+- NEVER forward sub-agent events through the existing `bridge.handleEvent()`. The event bridge accumulates content into `output.content`, which becomes the `AssistantMessage` returned to pi. Sub-agent content must not contaminate this.
+- Create a separate progress rendering path that converts sub-agent events into status text (e.g., "Reading src/provider.ts...") and emits them through a different channel.
+- If pi's stream API supports a status/progress event type, use that. If not, emit periodic `text_delta` events with status prefixes that are clearly distinguishable (but see Pitfall 4 for why this is risky).
 
-**Prevention:**
-- Always read stdout asynchronously and buffer events in-memory. Never do synchronous processing that blocks the event loop while stdout data is arriving.
-- Use Node.js streams properly -- pipe stdout through a transform, do not use synchronous `on('data')` handlers that block.
-- Set `highWaterMark` on stdin to a reasonable size if writing large prompts.
-- Implement a watchdog timer: if no stdout data arrives for N seconds after sending a control_response, assume deadlock and kill the process.
+**Warning signs:**
+- Test assertions on `output.content` start failing because sub-agent text appears in the output.
+- Users see "Let me read the file..." or internal Claude reasoning text in the response.
+- The `content.length` of the returned message grows unexpectedly.
 
-**Detection:** Extension hangs with no error output. Both parent and child processes show as running but idle in task manager. Adding verbose logging to stdin writes and stdout reads will show the last event before the hang.
-
-**Confidence:** HIGH -- fundamental IPC deadlock pattern, well-documented in OS and Node.js literature. Especially relevant here because the control protocol requires synchronous request-response over the same pipe pair.
-
-**Phase relevance:** Core subprocess communication (Phase 1). Must design the event loop correctly from the start.
-
----
-
-### Pitfall 6: Control Protocol Timing -- Late or Missed control_response
-
-**What goes wrong:** The Claude CLI sends a `control_request` with `subtype: "can_use_tool"` and expects a `control_response` with the matching `request_id` on stdin. If the response is not sent promptly, the CLI may time out, hang, or proceed with a default behavior (which may be to execute the tool -- the opposite of what the extension wants).
-
-**Why it happens:** The extension needs to: (1) parse the NDJSON line from stdout, (2) determine whether to allow or deny the tool, (3) construct the response JSON, (4) write it to stdin with a trailing newline. If any step introduces latency (e.g., async lookup of tool mappings, awaiting a pi callback), the response arrives late. The `request_id` matching is also easy to get wrong if multiple control requests arrive in quick succession.
-
-**Consequences:** Built-in tools execute inside the Claude CLI subprocess instead of being denied. This means file operations happen twice (once in Claude, once in pi), or worse, Claude writes files that pi does not know about, creating inconsistent state. For tool denial, this is a correctness-critical path.
-
-**Prevention:**
-- Pre-compute the allow/deny decision using a synchronous lookup (a Set of allowed tool name prefixes like `mcp__`).
-- Write the control_response immediately upon parsing the control_request, before processing any other events. The denial decision is deterministic and does not need async operations.
-- Always echo back the exact `request_id` from the request. Store nothing -- respond inline.
-- Add logging for every control_request received and control_response sent, with timestamps, to detect latency.
-- Implement a timeout: if a control_request is received but no response sent within 1 second, log an error.
-
-**Detection:** Claude CLI executing tools that should be denied (visible in stream events as tool execution results appearing without pi having executed them). Grep extension logs for `control_request` without matching `control_response`.
-
-**Confidence:** HIGH -- the control protocol is the core correctness mechanism for tool denial. The PROJECT.md explicitly calls out that CLI flags alone cannot achieve "propose but don't execute."
-
-**Phase relevance:** Tool denial implementation (Phase 1-2). This is the defining architectural differentiator of the project.
+**Phase to address:**
+Phase 1 (Sub-Agent Progress) -- architectural decision needed before any implementation.
 
 ---
 
-## Moderate Pitfalls
+### Pitfall 4: Injecting Progress Text into Pi's Stream Contract Violation
 
-### Pitfall 7: Token Explosion from Context Re-injection
+**What goes wrong:**
+To show sub-agent progress, the developer emits `text_delta` events with status text (e.g., "[Agent: reading file...]") into pi's `AssistantMessageEventStream`. This violates pi's stream contract: `text_delta` events are expected to be parts of the actual assistant response. Pi accumulates them into the message content, displays them as the response, and saves them to conversation history. On the next turn, Claude sees its own fake status messages in the history and gets confused.
 
-**What goes wrong:** Each stateless subprocess invocation spawns a fresh `claude -p` process. The CLI automatically loads `CLAUDE.md`, MCP tool descriptions, plugin skills, and global settings on startup. When the extension replays full conversation history as a flattened prompt, the effective context per request balloons to 50K+ tokens before any actual work begins. Over a multi-turn session, cumulative token consumption becomes enormous.
+**Why it happens:**
+Pi's `AssistantMessageEventStream` has a limited event vocabulary: `start`, `text_start`, `text_delta`, `text_end`, `thinking_start/delta/end`, `toolcall_start/delta/end`, `done`, `error`. There is no `progress` or `status` event type. The temptation is to abuse `text_delta` since it is the only way to send visible text to the user.
 
-**Why it happens:** The stateless model (spawn-per-request) means the CLI re-initializes everything each time. Combined with full history replay, you get O(n^2) token growth where n is conversation length -- turn 5 replays turns 1-4, turn 6 replays turns 1-5, etc.
+**How to avoid:**
+- Check pi-ai's `AssistantMessageEventStream` source for any undocumented event types or metadata fields that could carry progress info without polluting the message content. Specifically check if `stream.push()` accepts arbitrary event objects that the UI can render.
+- If pi supports custom event types that the UI ignores gracefully (pass-through), use a custom `{ type: "progress", text: "..." }` event. Verify this does not crash pi's event consumer.
+- If no clean path exists, consider writing progress to `console.log` / `console.warn` rather than the stream. GSD and pi both render console output. This is the safest fallback.
+- The absolute worst approach is injecting fake text_delta events. This will corrupt conversation history.
 
-**Prevention:**
-- Use `--system-prompt` to inject only what the subagent actually needs, blocking the CLI's default context loading where possible.
-- Consider `--no-user-config` or equivalent flags to prevent loading `~/.claude.json` settings.
-- Implement conversation summarization for long sessions -- after N turns, summarize older turns rather than replaying verbatim.
-- Monitor token counts in the result event and alert when they exceed thresholds.
-- Document the tradeoff: stateless is simpler but more expensive. If token costs become prohibitive, persistent sessions may need to be reconsidered.
+**Warning signs:**
+- Sub-agent status text appears in conversation history on subsequent turns.
+- Claude starts referencing "[Agent: reading file...]" in its responses.
+- The `AssistantMessage.content` contains status text mixed with real response text.
 
-**Detection:** Result events include token usage data. Track tokens_used per request and alert on upward trends within a session.
-
-**Confidence:** MEDIUM -- documented in the "50K tokens per subprocess turn" blog post and Claude Code issues. Severity depends on actual conversation lengths in pi workflows.
-
-**Phase relevance:** Optimization phase (Phase 3+). The stateless model should work correctly first, then be optimized for token efficiency.
-
----
-
-### Pitfall 8: Tool Name/Argument Mapping Mismatches
-
-**What goes wrong:** Bidirectional tool mapping between Claude's built-in names (Read, Write, Edit, Bash, Grep, Glob) and pi's equivalents (read, write, edit, bash, grep, find) requires translating both tool names and their argument schemas. Missing a mapping or getting an argument translation wrong causes tools to fail silently, produce wrong results, or throw errors that surface as unhelpful messages to the user.
-
-**Why it happens:** The argument schemas differ between systems: Claude uses `file_path` where pi uses `path`; Claude's Edit uses `old_string`/`new_string` where pi uses `oldText`/`newText`. The mapping is a manual, hand-maintained lookup table. New tools or argument changes in either system break the mapping silently.
-
-**Consequences:** Tool calls that work in testing break when Claude uses unexpected argument combinations. Partial mapping (e.g., mapping the name but not all arguments) produces cryptic errors deep in pi's tool execution layer. Worst case: a Write tool call goes through with wrong arguments and corrupts a file.
-
-**Prevention:**
-- Define the mapping as a single, centralized, well-typed data structure (a Map or object with TypeScript interfaces for both sides).
-- Write unit tests that verify every mapped tool name has corresponding argument translations in both directions.
-- Validate mapped arguments before passing to pi -- check required fields are present.
-- Log the raw Claude tool call AND the translated pi tool call side-by-side for debugging.
-- Watch Claude Code changelogs for tool schema changes.
-
-**Detection:** Tool execution errors from pi that mention missing required arguments. Diff the raw Claude tool_use event against the translated pi tool call in logs.
-
-**Confidence:** HIGH -- the reference project (claude-agent-sdk-pi) maintains this mapping, confirming it is necessary and error-prone.
-
-**Phase relevance:** Tool bridging implementation (Phase 2). Must be comprehensive and tested.
+**Phase to address:**
+Phase 1 (Sub-Agent Progress) -- must investigate pi's stream API before choosing approach.
 
 ---
 
-### Pitfall 9: Stream Event Translation Gaps and Ordering Errors
+### Pitfall 5: Actionable CLI Errors Swallowed by Catch-All Error Handler
 
-**What goes wrong:** Claude's API stream events (content_block_start, content_block_delta, content_block_stop, message_start, message_delta, message_stop) must be mapped to pi's event format (text_start, text_delta, text_end, toolcall_start, toolcall_delta, toolcall_end, thinking_start, thinking_delta, thinking_end, done, error). Missing an event, emitting events out of order, or failing to handle edge cases (e.g., empty content blocks, multiple tool calls in a single message) produces broken output in pi.
+**What goes wrong:**
+When the Claude CLI encounters any actionable error — context window limits, subscription usage caps (5-hour window maxed out), rate limits, auth failures, billing errors — the current `endStreamWithError()` wraps all errors into a generic `Error: <message>` text block. Pi has no way to distinguish error types and cannot take appropriate action (e.g., trigger history compaction for context overflow, suggest waiting for rate limits, or advise re-auth for auth failures).
 
-**Why it happens:** The two event protocols have different semantics. Claude uses `content_block_start` with an `index` field for multiplexing multiple blocks; pi expects sequential start/delta/end triplets. Claude may emit multiple content blocks in parallel (e.g., a thinking block and a text block simultaneously). Claude's `message_delta` contains stop_reason; pi's `done` event is separate.
+**Why it happens:**
+The current error handling is intentionally generic -- all errors become text content in a "done" event (not "error" events, because pi's agent-loop crashes on string error events). This was a pragmatic decision for v1.0 but means error categorization is lost.
 
-**Consequences:** Text appears jumbled in pi's UI. Tool calls show incomplete arguments. Thinking blocks are missing or interleaved with text. The `done` event fires before all text is delivered, causing truncation.
+**How to avoid:**
+- Parse the `assistant.error` field and `result` message for known error categories. The CLI surfaces these as typed error strings:
+  - `"invalid_request"` — context limit exceeded ("Prompt is too long"), or other API validation errors
+  - `"rate_limit"` — API rate limit or subscription usage cap (5-hour window maxed out)
+  - `"authentication_failed"` — CLI auth expired or invalid
+  - `"billing_error"` — subscription lapsed or usage cap exceeded
+  - `"server_error"` — transient API failures
+- Surface each error category with a specific, actionable message so downstream consumers (pi/GSD) can pattern-match and handle appropriately.
+- Do NOT try to implement recovery flows (compaction, retry, re-auth). The project constraint is to pass through clear, categorized error messages and let pi/user handle them.
+- Also detect the `system` message with `subtype: "api_retry"` — these retry events precede final errors and provide early warning.
 
-**Prevention:**
-- Build a state machine that tracks the current "active block" by index and type (text, tool_use, thinking).
-- Emit pi events only on state transitions (e.g., emit `text_end` when a new block starts or the message ends, not on every delta).
-- Handle the edge case where Claude sends `content_block_stop` for one block and `content_block_start` for another in the same chunk.
-- Write integration tests that replay captured NDJSON streams from real Claude sessions and verify the pi event sequence.
-- Pay special attention to `message_delta` with `stop_reason: "end_turn"` vs `stop_reason: "tool_use"` -- they require different pi event sequences.
+**Warning signs:**
+- Users report "Unknown error from Claude CLI" when conversations get long or subscriptions max out.
+- The same error handling fires for context limits, subscription caps, and auth failures, making debugging impossible.
+- Pi's error handler receives generic text and cannot offer targeted advice.
 
-**Detection:** Compare pi's displayed output against the raw Claude stream events. Missing text or garbled tool calls indicate mapping bugs.
-
-**Confidence:** HIGH -- the reference project's core complexity is in this translation layer, confirming it is non-trivial.
-
-**Phase relevance:** Stream bridging implementation (Phase 2). Requires careful state management.
-
----
-
-### Pitfall 10: MCP Proxy Server Lifecycle Management
-
-**What goes wrong:** Custom pi tools need to be exposed to the Claude CLI via an MCP server. The reference project uses the SDK's `createSdkMcpServer()`. This project must implement its own MCP server (likely stdio-based) spawned alongside the Claude process and registered via `--mcp-config`. If the MCP server starts too slowly, crashes, or is not properly cleaned up, the Claude process either fails to discover the tools or hangs during initialization.
-
-**Why it happens:** The MCP SDK has a 60-second default timeout for server connections. If the MCP server takes longer to start (e.g., waiting for pi to register tools), the connection fails. On the other end, if the MCP server outlives the Claude subprocess, it becomes an orphaned process.
-
-**Consequences:** Custom pi tools are unavailable to Claude, silently degrading capability. Or the MCP server process leaks on every request, accumulating like the Claude subprocess hang (Pitfall 1). In the worst case, a crashing MCP server causes the Claude process to error out mid-conversation.
-
-**Prevention:**
-- Start the MCP server before spawning the Claude process. Verify it is ready (listening) before passing it via `--mcp-config`.
-- Use stdio transport for the MCP server (not HTTP) to simplify lifecycle -- the server dies when its stdin/stdout pipes close.
-- Tie the MCP server's lifecycle to the Claude subprocess's lifecycle. When the Claude process is killed (Pitfall 1), ensure the MCP server is also killed.
-- Implement health checks: if the MCP server stops responding, kill and restart both it and the Claude process.
-- Consider an in-process MCP server (using Node.js worker threads or direct function calls) to avoid process management complexity entirely.
-
-**Detection:** Claude's stream events will not contain any `mcp__custom-tools__*` tool calls if the MCP server failed to connect. Log MCP server startup and connection events.
-
-**Confidence:** MEDIUM -- the reference project sidesteps this by using the SDK's built-in MCP server. This project must solve it independently.
-
-**Phase relevance:** Custom tool proxy (Phase 3). Can be deferred until built-in tool mapping works.
+**Phase to address:**
+Phase 2 (Error Passthrough) -- separate from progress work.
 
 ---
 
-### Pitfall 11: Subprocess Startup Latency per Request
+### Pitfall 6: Missing Result Event Causes Infinite Hang
 
-**What goes wrong:** Each pi LLM request spawns a fresh `claude -p` subprocess. The Claude CLI has ~12 seconds of startup overhead (module loading, environment setup, config reading, MCP server initialization). This means every single tool-using interaction in pi takes 12+ seconds before the LLM even starts generating.
+**What goes wrong:**
+The Claude CLI intermittently fails to emit the final `{"type":"result",...}` event after tool execution in stream-json mode (documented in anthropics/claude-code#1920). The subprocess stays alive, stdout stays open, readline never closes, and the promise in `provider.ts` (`await new Promise<void>(resolve => rl.on('close', resolve))`) never resolves. The pi request hangs indefinitely.
 
-**Why it happens:** The stateless model requires a fresh process per request. The Claude CLI is not designed for rapid start-stop cycles -- it is designed for interactive sessions.
+**Why it happens:**
+This is a known upstream bug. The CLI sometimes completes tool execution but does not emit the result event. The current code relies on the `result` message to trigger `cleanupProcess()` and `rl.close()`. Without it, there is no safety net since the previous 180-second inactivity timeout was removed in favor of using `parent_tool_use_id` checks to avoid break-early on sub-agent events.
 
-**Consequences:** The extension feels unacceptably slow compared to direct API-based pi providers. Users abandon it after a few interactions. Multi-step agentic workflows that involve many LLM calls become unusable.
+**How to avoid:**
+- Consider re-introducing a safety timeout: maximum wall-clock time per request (e.g., 10 minutes) that fires regardless of activity, as a backstop for this upstream bug.
+- Ensure process cleanup paths handle this case gracefully — if the subprocess exits without a result event, the `proc.on("close")` handler should still clean up and end the stream.
 
-**Prevention:**
-- Accept the latency for the initial implementation (Phase 1). Do not prematurely optimize.
-- Profile the actual startup time with the specific CLI flags used (`-p --input-format stream-json --output-format stream-json --verbose`). The 12-second figure is from SDK benchmarks and may differ.
-- For Phase 3+, investigate persistent subprocess sessions (stream-json multi-turn mode) where the process stays alive between requests. The PROJECT.md lists this as "Out of Scope" but it may become necessary.
-- Consider a process warm-up strategy: pre-spawn a Claude process during idle time so it is ready when the next request arrives.
+**Warning signs:**
+- Orphaned `claude` processes in task manager after pi operations.
+- `rl.on('close')` promise never resolving in certain edge cases.
+- Requests that hang indefinitely with no timeout.
 
-**Detection:** Measure time from request receipt to first token emission. If consistently >10 seconds, startup latency dominates.
-
-**Confidence:** HIGH -- documented in Claude Agent SDK issue #34 with benchmarks.
-
-**Phase relevance:** All phases, but optimization in Phase 3+. Correctness before performance.
-
----
-
-## Minor Pitfalls
-
-### Pitfall 12: Forgetting to End stdin After Prompt Delivery (Stateless Mode)
-
-**What goes wrong:** In stateless `-p` mode, the full prompt is sent once and then the CLI processes it. If `child.stdin.end()` is not called after writing the prompt (or the stream-json initial message), the CLI may wait for more input instead of processing what it has.
-
-**Prevention:** Call `child.stdin.end()` after writing the last NDJSON message for the initial prompt. In stream-json mode where you need stdin open for control_responses, do NOT end stdin -- but be aware that this means the CLI's "is input complete?" signal must come from the message content, not the stream closing. Verify which mode you are in and handle accordingly.
-
-**Confidence:** MEDIUM -- depends on how stream-json mode handles input completion vs the simpler `-p` pipe mode.
-
-**Phase relevance:** Phase 1 (subprocess communication).
+**Phase to address:**
+Phase 2 (Error Passthrough) -- consider adding a wall-clock safety timeout alongside error categorization.
 
 ---
 
-### Pitfall 13: Model ID Mismatch Between pi and Claude CLI
+### Pitfall 7: Sub-Agent Events Have Different NDJSON Wrapper Structure
 
-**What goes wrong:** pi's `getModels("anthropic")` returns model IDs in one format (e.g., `claude-sonnet-4-5-20250929`). The Claude CLI may expect model IDs in a different format, or the CLI may not support passing model IDs at all when using Pro/Max subscription auth (the subscription determines the model tier).
+**What goes wrong:**
+The developer assumes sub-agent events have the same NDJSON wrapper structure as top-level events (`{ type: "stream_event", event: { ... } }`) and just differ by having `parent_tool_use_id` set. In reality, the CLI may emit additional message types during sub-agent execution: `{ type: "user" }` (tool results being fed back to sub-agent), `{ type: "assistant" }` (complete sub-agent messages), and `{ type: "tool_result" }` messages. These are not `stream_event` wrappers and won't be parsed by the existing `msg.type === "stream_event"` check.
 
-**Prevention:** Test which `--model` flag values the CLI accepts with subscription auth. Map pi model IDs to CLI-accepted values. If the CLI ignores `--model` with subscription auth, document this limitation and default to the subscription's model.
+**Why it happens:**
+The official docs describe `parent_tool_use_id` on `stream_event` messages, but the CLI also emits non-streaming messages during sub-agent turns. Issue #12 notes the CLI emits "system, stream_event, direct, tool_result, and user message types during sub-agent execution." The existing parser silently ignores unknown types, so these just vanish.
 
-**Confidence:** LOW -- needs experimental verification.
+**How to avoid:**
+- Before implementing progress, add debug logging that prints ALL NDJSON message types received during a sub-agent operation. Run a real test where Claude uses Agent/Task internally and capture the complete event stream.
+- Design the progress handler to extract useful information from multiple message types, not just `stream_event`. A `{ type: "assistant", message: { content: [...] } }` might contain tool_use blocks that are useful for progress display.
+- Add the non-stream_event types to the `NdjsonMessage` union type in `types.ts`.
 
-**Phase relevance:** Phase 1 (subprocess spawning arguments).
+**Warning signs:**
+- Progress handler only shows partial information (misses tool results, only shows text deltas).
+- Debug logging reveals message types you are not handling.
+- Sub-agent operations that involve many tool calls show less progress than expected.
 
----
-
-### Pitfall 14: stderr Noise Interpreted as Errors
-
-**What goes wrong:** The Claude CLI writes progress messages, warnings, and diagnostic information to stderr. The extension captures stderr and interprets any output as an error condition, triggering error events in pi or aborting the request.
-
-**Prevention:** Capture stderr and log it, but do not treat stderr output as an error condition. Only treat non-zero exit codes (combined with no result event) as errors. The `result` event's `subtype` field (`success` vs `error`) is the authoritative error signal.
-
-**Confidence:** HIGH -- standard subprocess best practice.
-
-**Phase relevance:** Phase 1 (subprocess management).
-
----
-
-### Pitfall 15: Race Between Process Exit and Final stdout Data
-
-**What goes wrong:** The Claude subprocess exits (emits `close` event) before all stdout data has been consumed by the parent. The remaining buffered data is lost, potentially including the final `result` event.
-
-**Prevention:** Always process the `close` event after the stdout `end` event. Use `child.on('close')` not `child.on('exit')` as the authoritative "process is done" signal, since `close` fires after all stdio streams are closed. Even better, rely on the `result` event from the NDJSON stream (Pitfall 1) rather than process lifecycle events.
-
-**Confidence:** HIGH -- well-documented Node.js child_process behavior.
-
-**Phase relevance:** Phase 1 (subprocess lifecycle).
+**Phase to address:**
+Phase 1 (Sub-Agent Progress) -- investigate actual wire format before implementation.
 
 ---
 
-## Phase-Specific Warnings
+### Pitfall 8: Extended Thinking Suppresses StreamEvent Messages
 
-| Phase Topic | Likely Pitfall | Mitigation |
-|-------------|---------------|------------|
-| Subprocess spawning (Phase 1) | #1 Process never exits, #4 Windows spawn failure, #5 Deadlock | Kill-after-result, cross-spawn, async stdout reading |
-| NDJSON parsing (Phase 1) | #2 Split chunks, #3 Debug corruption | split2 + JSON validation per line |
-| Control protocol (Phase 1-2) | #6 Late control_response | Synchronous allow/deny decision, immediate write |
-| Tool mapping (Phase 2) | #8 Argument mismatch | Typed centralized mapping, unit tests |
-| Stream event bridging (Phase 2) | #9 Event ordering | State machine, integration tests with captured streams |
-| MCP proxy (Phase 3) | #10 Lifecycle leaks | Stdio transport, tied lifecycle, in-process option |
-| Performance (Phase 3+) | #7 Token explosion, #11 Startup latency | System prompt isolation, potential persistent sessions |
+**What goes wrong:**
+When extended thinking is enabled (via `--effort` flag), the Agent SDK documentation states that `StreamEvent` messages may not be emitted. The user enables thinking (e.g., reasoning: "high"), and suddenly sub-agent progress stops working entirely because no `stream_event` messages arrive. The user sees the old "Working..." silence.
+
+**Why it happens:**
+The Agent SDK docs explicitly warn: "when you explicitly set max_thinking_tokens, StreamEvent messages are not emitted." The CLI uses `--effort` not `--max-thinking-tokens`, but the underlying behavior may be similar. The CLI's `--effort` flag maps to thinking configuration internally, and the streaming suppression may apply.
+
+**How to avoid:**
+- Test progress handling with ALL effort levels: omitted (default), low, medium, high, max.
+- If StreamEvent messages are suppressed with extended thinking, the progress feature needs a fallback. Non-stream_event messages (type: "assistant", type: "user") may still be emitted and can be used as a degraded progress signal.
+- Document the limitation clearly: "Progress visibility may be reduced when extended thinking is enabled."
+- Do not silently fail -- at minimum, log a warning when thinking is enabled and no progress events are observed after a timeout.
+
+**Warning signs:**
+- Progress works in tests without thinking but fails in production where users enable reasoning.
+- The event stream contains only `system` init + final `result` with no `stream_event` between them.
+- All tests pass but users with Opus models (which commonly use high effort) report no progress.
+
+**Phase to address:**
+Phase 1 (Sub-Agent Progress) -- test matrix must include thinking-enabled scenarios.
+
+---
+
+## Technical Debt Patterns
+
+Shortcuts that seem reasonable but create long-term problems.
+
+| Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
+|----------|-------------------|----------------|-----------------|
+| Using `console.log` for progress instead of stream events | Works immediately, no pi API investigation needed | Progress not visible in GSD's structured output; output mixed with debug noise; cannot be themed/styled | As an interim step for Phase 1 if pi stream API investigation is inconclusive; must be replaced |
+| Hardcoding error message patterns for context limit detection | Quick to implement, covers the known cases | New CLI versions may change error messages; regex patterns rot; false positives on similar text | Acceptable for v0.4.0 as the CLI error format is currently stable; add a fallback for unrecognized errors |
+| Forwarding raw sub-agent tool names without mapping | Simpler code, avoids maintaining a second mapping layer | Users see internal Claude names (TodoRead, ToolSearch) instead of meaningful descriptions | Never -- always translate to user-friendly descriptions ("Searching...", "Reading file...") |
+| Resetting inactivity timer on all NDJSON lines including sub-agent events | Simple, one-line change | A stuck CLI that is emitting sub-agent events but never completing will never timeout | N/A — inactivity timeout was removed; use wall-clock cap instead if re-introducing a safety timeout |
+
+## Integration Gotchas
+
+Common mistakes when connecting to the Claude CLI subprocess and pi's stream API.
+
+| Integration | Common Mistake | Correct Approach |
+|-------------|----------------|------------------|
+| Claude CLI stream-json | Assuming all events during sub-agent execution are `stream_event` type | The CLI emits `user`, `assistant`, `tool_result`, and `direct` messages during sub-agent turns. Handle or explicitly skip each type. |
+| Claude CLI stream-json | Not handling `system` messages with `subtype: "api_retry"` | These indicate retryable errors (rate limit, server error) and precede the actual error. Surface them as progress ("Retrying in 5s...") or at minimum log them. |
+| Pi AssistantMessageEventStream | Pushing events after `stream.end()` has been called | Causes "write after end" errors. Always check `streamEnded` and `broken` guards before pushing. |
+| Pi AssistantMessageEventStream | Assuming pi ignores unknown event types | Pi may throw on unrecognized event types, or may pass them through silently. Must test with pi's actual implementation before relying on custom event types. |
+| Process cleanup on error | Calling `endStreamWithError()` but forgetting to also `clearTimeout(inactivityTimer)` and `forceKillProcess(proc)` | Errors from sub-agent progress handling must follow the same cleanup path as the existing error handlers. Centralize cleanup. |
+| Windows subprocess | Assuming SIGKILL works identically on Windows | Node.js translates SIGKILL to `TerminateProcess()` on Windows, which does work. But stderr may not flush before termination, losing error context. Add a brief grace period before kill. |
+
+## Performance Traps
+
+Patterns that work at small scale but fail with heavy sub-agent usage.
+
+| Trap | Symptoms | Prevention | When It Breaks |
+|------|----------|------------|----------------|
+| Accumulating all sub-agent events in memory | Memory grows linearly with sub-agent event count; long Agent/Task operations generate thousands of events | Only track the latest N events or latest state per sub-agent; discard old events | When Claude uses Agent tool for large codebase analysis (hundreds of file reads) |
+| Emitting a pi stream event for every sub-agent NDJSON line | Pi's stream consumer processes each event synchronously; flooding it degrades UI responsiveness | Debounce/throttle progress updates (e.g., max 1 update per 500ms per sub-agent) | When sub-agent emits rapid-fire text_delta events during code generation |
+| String concatenation for progress messages | Building status strings on every event | Only build status text when actually emitting (after debounce) | Thousands of sub-agent events per request |
+
+## UX Pitfalls
+
+Common user experience mistakes when surfacing sub-agent progress.
+
+| Pitfall | User Impact | Better Approach |
+|---------|-------------|-----------------|
+| Showing raw internal tool names (ToolSearch, TodoRead, Agent) | Users don't understand Claude's internal tool vocabulary | Map to user-friendly descriptions: "Searching codebase...", "Reading file: path", "Delegating to sub-agent..." |
+| Showing every single sub-agent tool call | Information overload; screen fills with progress spam | Show summarized progress: tool name + target file, not full arguments. Throttle updates. |
+| Not indicating when sub-agent work starts and ends | User doesn't know if progress output is the response or intermediate | Clear visual bracketing: "[Working: reading 3 files...]" with a completion indicator |
+| Showing sub-agent thinking/reasoning text | Confusing internal reasoning mixed with progress | Filter out thinking content blocks from sub-agent events entirely |
+| No progress for long-running sub-agent operations that have no stream events | User sees nothing for 30+ seconds, thinks it's frozen | Emit a heartbeat message if no sub-agent events arrive within N seconds: "Still working..." |
+
+## "Looks Done But Isn't" Checklist
+
+Things that appear complete but are missing critical pieces.
+
+- [ ] **Sub-agent progress:** Often missing handling for sub-agent `message_stop` -- verify it does NOT trigger break-early kill
+- [ ] **Sub-agent progress:** Often missing handling for nested sub-agents (Agent calling Agent) -- `parent_tool_use_id` may chain. Verify progress works for depth > 1
+- [ ] **Error passthrough:** Often missing the `system/api_retry` events that precede errors -- verify retry events are surfaced or at least logged
+- [ ] **Error passthrough:** Often missing stderr parsing -- the CLI sometimes writes errors to stderr without a corresponding result event. Verify stderr is checked on non-zero exit
+- [ ] **Error passthrough:** Often missing the "Prompt is too long" error case -- this is a CLI-level rejection (input_tokens: 0) distinct from API errors. Verify it is detected and surfaced.
+- [ ] **Progress + break-early:** The `broken` guard prevents sub-agent events from being processed after break-early. Verify progress handler respects the guard.
+- [ ] **Progress + inactivity timeout:** Sub-agent events should reset the inactivity timer. Verify the timer reset is in the right place (before the sub-agent filter, not inside it).
+- [ ] **Thinking + progress:** Test progress with `--effort high` and `--effort max` to verify stream events are still emitted. Document any degradation.
+
+## Recovery Strategies
+
+When pitfalls occur despite prevention, how to recover.
+
+| Pitfall | Recovery Cost | Recovery Steps |
+|---------|---------------|----------------|
+| Sub-agent events trigger break-early | LOW | Revert the progress changes and re-add with the correct guard structure. No data loss -- the user just gets a truncated response. |
+| Progress text corrupts AssistantMessage content | MEDIUM | Must clean up conversation history if corrupted messages were saved. Add a content filter to strip progress text patterns on the next turn. |
+| Context limit error not detected | LOW | Users retry manually. Improve pattern matching for the specific error. No lasting damage. |
+| Missing result event causes hang | LOW | Inactivity timeout eventually fires (180s). Reduce timeout if needed. Add wall-clock cap. |
+| Extended thinking suppresses progress | LOW | Graceful degradation -- user sees "Working..." as before. Document the limitation. |
+| Readline buffer race corrupts stream | MEDIUM | Hard to reproduce. Add defensive guards, audit all event push paths. Existing test suite may not catch it; need integration tests with real subprocess output. |
+
+## Pitfall-to-Phase Mapping
+
+How roadmap phases should address these pitfalls.
+
+| Pitfall | Prevention Phase | Verification |
+|---------|------------------|--------------|
+| Sub-agent events break break-early | Phase 1 (Progress) | Regression test: sub-agent message_stop does NOT kill subprocess |
+| Readline buffered lines after close | Phase 1 (Progress) | Test: send events after rl.close(), verify no "write after end" errors |
+| Sub-agent text mixed into response | Phase 1 (Progress) | Test: output.content contains zero sub-agent text after a sub-agent operation |
+| Progress text violates stream contract | Phase 1 (Progress) | Investigation: test pi's stream.push() with custom event types before implementing |
+| Context limit errors swallowed | Phase 2 (Error Passthrough) | Test: simulate "Prompt is too long" result message, verify classified error output |
+| Missing result event hang | Phase 2 (Error Passthrough) | Test: simulate no result event, verify inactivity timeout fires and is classified |
+| Sub-agent NDJSON wrapper structure | Phase 1 (Progress) | Investigation: capture real sub-agent event stream, document all message types |
+| Extended thinking suppresses events | Phase 1 (Progress) | Manual test: run with --effort max, verify progress events arrive (or document limitation) |
 
 ## Sources
 
-- [Claude Code CLI hangs after result event - Issue #25629](https://github.com/anthropics/claude-code/issues/25629)
-- [Claude Code stream-json input hang - Issue #3187](https://github.com/anthropics/claude-code/issues/3187)
-- [Claude Code debug messages corrupt stdout - Issue #12007](https://github.com/anthropics/claude-code/issues/12007)
-- [Claude Code persistent JSON parse error on Windows - Issue #14442](https://github.com/anthropics/claude-code/issues/14442)
-- [Claude Code can't be spawned from Node.js - Issue #771](https://github.com/anthropics/claude-code/issues/771)
-- [ClaudeSDKClient hangs on Windows - Issue #208](https://github.com/anthropics/claude-agent-sdk-python/issues/208)
-- [Claude SDK Windows path detection - Issue #252](https://github.com/anthropics/claude-agent-sdk-python/issues/252)
-- [Claude Agent SDK 12s overhead per call - Issue #34](https://github.com/anthropics/claude-agent-sdk-typescript/issues/34)
-- [50K tokens per subprocess turn - DEV Community](https://dev.to/jungjaehoon/why-claude-code-subagents-waste-50k-tokens-per-turn-and-how-to-fix-it-41ma)
-- [Node.js Child Process Documentation](https://nodejs.org/api/child_process.html)
-- [Node.js Backpressuring in Streams](https://nodejs.org/en/learn/modules/backpressuring-in-streams)
-- [split2 npm package](https://www.npmjs.com/package/split2)
-- [Node.js child_process stdout truncation - Issue #19218](https://github.com/nodejs/node/issues/19218)
-- [Node.js spawn stdin issues - Issue #2985](https://github.com/nodejs/node/issues/2985)
-- [Claude Code duplicate session entries - Issue #5034](https://github.com/anthropics/claude-code/issues/5034)
-- [claude-agent-sdk-pi reference project](https://github.com/prateekmedia/claude-agent-sdk-pi)
+- [Claude Code headless/CLI docs](https://code.claude.com/docs/en/headless) -- stream-json format, api_retry events, result message structure
+- [Agent SDK streaming output](https://platform.claude.com/docs/en/agent-sdk/streaming-output) -- parent_tool_use_id, StreamEvent reference, thinking limitation
+- [Missing result event bug (anthropics/claude-code#1920)](https://github.com/anthropics/claude-code/issues/1920) -- CLI fails to emit result event intermittently
+- [Stream-json input hang (anthropics/claude-code#3187)](https://github.com/anthropics/claude-code/issues/3187) -- Windows-specific stdin hang after second turn
+- [Prompt too long error (anthropics/claude-code#12312)](https://github.com/anthropics/claude-code/issues/12312) -- CLI rejects prompts below model context limit
+- [Node.js readline line-after-close (nodejs/node#22615)](https://github.com/nodejs/node/issues/22615) -- buffered lines fire after rl.close()
+- [Node.js stdout not flushed on exit (nodejs/node#2972)](https://github.com/nodejs/node/issues/2972) -- stderr may be truncated on process kill
+- Project codebase: `src/provider.ts`, `src/event-bridge.ts`, `src/stream-parser.ts`, `src/types.ts`
+- Project memory: `feedback_control_request_never_fires.md`, `project_phase4_status.md`, `feedback_jiti_for_await.md`
+
+---
+*Pitfalls research for: v0.4.0 Observability milestone (sub-agent progress + error passthrough)*
+*Researched: 2026-03-21*

@@ -32,7 +32,7 @@ Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend
 
 **Target features:**
 - Show sub-agent progress during internal tool execution instead of silent "Working..." (#12)
-- Pass through context limit errors to the user instead of swallowing them (#2)
+- Pass through all actionable CLI errors (context limits, subscription caps, rate limits, auth failures, billing errors) instead of swallowing them (#2)
 - Update README with pi install instructions (#3)
 
 ### Out of Scope
