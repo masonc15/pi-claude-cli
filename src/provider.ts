@@ -235,7 +235,7 @@ export function streamViaCli(
         if (msg.type === "stream_event") {
           // Only forward top-level events to pi's event bridge.
           // Sub-agent events (parent_tool_use_id !== null) are internal to the CLI.
-          const isTopLevel = !(msg as any).parent_tool_use_id;
+          const isTopLevel = !msg.parent_tool_use_id;
           if (isTopLevel) {
             bridge.handleEvent(msg.event);
           }

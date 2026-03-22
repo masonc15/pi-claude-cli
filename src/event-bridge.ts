@@ -20,7 +20,7 @@ import {
  */
 interface TrackedToolBlock {
   type: "tool_use";
-  index: number;
+  index?: number;
   id: string;
   name: string; // Already mapped to pi name
   claudeName: string; // Original Claude name for arg translation
@@ -270,7 +270,7 @@ export function createEventBridge(
         // Try to parse accumulated JSON -- on success update args, on failure keep previous
         try {
           block.arguments = JSON.parse(block.partialJson);
-          (output.content[idx] as any).arguments = block.arguments;
+          (output.content[idx] as ToolCall).arguments = block.arguments;
         } catch {
           // Partial JSON not yet parseable -- keep previous arguments
         }
@@ -305,7 +305,7 @@ export function createEventBridge(
 
     const block = blocks[idx];
     // Clean up the tracking index from the block (no longer needed)
-    delete (block as any).index;
+    delete block.index;
 
     if (block.type === "text") {
       stream.push({
@@ -333,7 +333,7 @@ export function createEventBridge(
 
       // Update output.content with final arguments
       const contentBlock = output.content[idx] as ToolCall;
-      (contentBlock as any).arguments = finalArgs;
+      contentBlock.arguments = finalArgs as Record<string, any>;
 
       // ToolCall.arguments is typed as Record<string, any> in pi-ai, but we
       // intentionally emit a raw string when JSON parse fails completely.
