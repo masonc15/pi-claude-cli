@@ -1,7 +1,7 @@
 # Requirements: pi-claude-cli v0.4.0 Observability
 
 **Defined:** 2026-03-21
-**Core Value:** Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend — no API key, no separate billing, full Claude model access through the official CLI.
+**Core Value:** Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend -- no API key, no separate billing, full Claude model access through the official CLI.
 
 ## v0.4.0 Requirements
 
@@ -54,22 +54,22 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ERR-01 | — | Pending |
-| ERR-02 | — | Pending |
-| ERR-03 | — | Pending |
-| ERR-04 | — | Pending |
-| ERR-05 | — | Pending |
-| ERR-06 | — | Pending |
-| PROG-01 | — | Pending |
-| PROG-02 | — | Pending |
-| PROG-03 | — | Pending |
-| DOC-01 | — | Pending |
+| ERR-01 | Phase 8 | Pending |
+| ERR-02 | Phase 8 | Pending |
+| ERR-03 | Phase 8 | Pending |
+| ERR-04 | Phase 8 | Pending |
+| ERR-05 | Phase 8 | Pending |
+| ERR-06 | Phase 8 | Pending |
+| PROG-01 | Phase 9 | Pending |
+| PROG-02 | Phase 9 | Pending |
+| PROG-03 | Phase 9 | Pending |
+| DOC-01 | Phase 10 | Pending |
 
 **Coverage:**
 - v0.4.0 requirements: 10 total
-- Mapped to phases: 0
-- Unmapped: 10 ⚠️
+- Mapped to phases: 10
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-21*
-*Last updated: 2026-03-21 after initial definition*
+*Last updated: 2026-03-21 after roadmap creation*
