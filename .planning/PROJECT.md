@@ -44,7 +44,7 @@ Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend
 
 ## Context
 
-**Current state:** v0.3.1 shipped on npm. 7,991 LOC TypeScript. 292+ tests across 9 test files. Published as `pi-claude-cli` with `pi-package` keyword. v1.0 MVP milestone completed (6 phases, 26/26 requirements).
+**Current state:** v0.3.1 shipped on npm. 7,991 LOC TypeScript. 302+ tests across 9 test files. Published as `pi-claude-cli` with `pi-package` keyword. v1.0 MVP milestone completed (6 phases, 26/26 requirements). Phase 7 (Type Foundation) complete — NDJSON types now cover all CLI message shapes.
 
 **Architecture:** Each pi LLM request spawns a `claude -p` subprocess. Extension parses NDJSON output via readline, bridges Claude API events to pi's `AssistantMessageEventStream`, and kills the subprocess at `message_stop` (break-early) before Claude can auto-execute tools. Session resume reuses Claude's `--resume` flag to avoid replaying full conversation history.
 
@@ -71,4 +71,4 @@ Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend
 | `--input-format stream-json` required | Needed for control_response messages; cannot drop input formatter | Good — enables full bidirectional protocol |
 
 ---
-*Last updated: 2026-03-21 after v0.4.0 milestone start*
+*Last updated: 2026-03-22 after Phase 7 (Type Foundation) complete*
