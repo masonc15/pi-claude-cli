@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v0.4.0
 milestone_name: Observability
 status: unknown
-last_updated: "2026-03-22T03:25:50.120Z"
+last_updated: "2026-03-22T19:58:37.165Z"
 progress:
   total_phases: 4
   completed_phases: 1
@@ -54,5 +54,5 @@ Plan: Not started
 
 ## Session Continuity
 
-Resume file: None
+Resume file: .planning/phases/08-error-passthrough/08-CONTEXT.md
 Next action: `/gsd:plan-phase 7` to plan the Type Foundation phase
