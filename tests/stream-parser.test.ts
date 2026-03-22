@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { parseLine } from "../src/stream-parser";
 import type {
+  ClaudeAssistantMessage,
   ClaudeStreamEventMessage,
   ClaudeResultMessage,
   ClaudeSystemMessage,
@@ -163,6 +164,87 @@ describe("parseLine", () => {
       const result = parseLine(line);
       expect(result).not.toBeNull();
       expect(result!.type).toBe("result");
+    });
+  });
+
+  describe("new message types", () => {
+    it("parses an assistant message", () => {
+      const line = JSON.stringify({
+        type: "assistant",
+        message: { content: [], model: "claude-sonnet-4-5-20250929" },
+        session_id: "s1",
+      });
+      const result = parseLine(line);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("assistant");
+      expect((result as ClaudeAssistantMessage).session_id).toBe("s1");
+    });
+
+    it("parses an assistant message with error category", () => {
+      const line = JSON.stringify({
+        type: "assistant",
+        error: "rate_limit",
+        message: { content: [] },
+      });
+      const result = parseLine(line);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("assistant");
+      expect((result as ClaudeAssistantMessage).error).toBe("rate_limit");
+    });
+
+    it("parses a result with error_during_execution subtype", () => {
+      const line = JSON.stringify({
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: ["Tool failed"],
+        session_id: "s1",
+      });
+      const result = parseLine(line);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("result");
+      const res = result as ClaudeResultMessage;
+      expect(res.subtype).toBe("error_during_execution");
+      expect(res.is_error).toBe(true);
+      expect(res.errors).toEqual(["Tool failed"]);
+    });
+
+    it("parses a result with error_max_turns subtype", () => {
+      const line = JSON.stringify({
+        type: "result",
+        subtype: "error_max_turns",
+        error: "Max turns reached",
+      });
+      const result = parseLine(line);
+      expect(result).not.toBeNull();
+      expect((result as ClaudeResultMessage).subtype).toBe("error_max_turns");
+    });
+
+    it("parses a stream_event with parent_tool_use_id", () => {
+      const line = JSON.stringify({
+        type: "stream_event",
+        event: { type: "message_start" },
+        parent_tool_use_id: "toolu_abc",
+      });
+      const result = parseLine(line);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("stream_event");
+      expect((result as ClaudeStreamEventMessage).parent_tool_use_id).toBe(
+        "toolu_abc",
+      );
+    });
+
+    it("parses a stream_event with null parent_tool_use_id (top-level)", () => {
+      const line = JSON.stringify({
+        type: "stream_event",
+        event: { type: "message_start" },
+        parent_tool_use_id: null,
+      });
+      const result = parseLine(line);
+      expect(result).not.toBeNull();
+      expect(
+        (result as ClaudeStreamEventMessage).parent_tool_use_id,
+      ).toBeNull();
     });
   });
 
