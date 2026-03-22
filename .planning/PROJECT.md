@@ -26,9 +26,14 @@ Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend
 
 ### Active
 
-- [ ] Show sub-agent progress instead of silent "Working..." (#12)
-- [ ] Pass through context limit errors (#2)
-- [ ] Add pi install instructions to README (#3)
+## Current Milestone: v0.4.0 Observability
+
+**Goal:** Surface subprocess activity and errors to the user instead of silently swallowing them.
+
+**Target features:**
+- Show sub-agent progress during internal tool execution instead of silent "Working..." (#12)
+- Pass through context limit errors to the user instead of swallowing them (#2)
+- Update README with pi install instructions (#3)
 
 ### Out of Scope
 
@@ -39,7 +44,7 @@ Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend
 
 ## Context
 
-**Current state:** v0.3.1 shipped on npm. 7,991 LOC TypeScript. 292+ tests across 9 test files. Published as `pi-claude-cli` with `pi-package` keyword.
+**Current state:** v0.3.1 shipped on npm. 7,991 LOC TypeScript. 292+ tests across 9 test files. Published as `pi-claude-cli` with `pi-package` keyword. v1.0 MVP milestone completed (6 phases, 26/26 requirements).
 
 **Architecture:** Each pi LLM request spawns a `claude -p` subprocess. Extension parses NDJSON output via readline, bridges Claude API events to pi's `AssistantMessageEventStream`, and kills the subprocess at `message_stop` (break-early) before Claude can auto-execute tools. Session resume reuses Claude's `--resume` flag to avoid replaying full conversation history.
 
@@ -66,4 +71,4 @@ Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend
 | `--input-format stream-json` required | Needed for control_response messages; cannot drop input formatter | Good — enables full bidirectional protocol |
 
 ---
-*Last updated: 2026-03-21 after v1.0 milestone*
+*Last updated: 2026-03-21 after v0.4.0 milestone start*

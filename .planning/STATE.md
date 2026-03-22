@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: MVP
-status: archived
-stopped_at: Milestone v1.0 archived
-last_updated: "2026-03-22T00:00:00.000Z"
-last_activity: 2026-03-21 -- Milestone v1.0 archived
+milestone: v0.4.0
+milestone_name: Observability
+status: planning
+stopped_at: Defining requirements
+last_updated: "2026-03-21T00:00:00.000Z"
+last_activity: 2026-03-21 -- Milestone v0.4.0 started
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 13
-  completed_plans: 13
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -21,15 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** Enable pi users to leverage their Claude Pro/Max subscription as the LLM backend via the official CLI
-**Current focus:** Planning next milestone
+**Current focus:** Milestone v0.4.0 Observability
 
 ## Current Position
 
-Milestone v1.0 MVP shipped and archived.
-Next: `/gsd:new-milestone` to define v1.1 scope.
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-03-21 — Milestone v0.4.0 started
 
-## Open Issues
+## Accumulated Context
 
-- #12 — Show sub-agent progress instead of silent "Working..."
-- #3 — Add pi install instructions to README
-- #2 — Pass through context limit errors
+- v1.0 MVP shipped: 6 phases, 13 plans, 26/26 requirements, 7,991 LOC
+- Custom tool result replay is an architectural limitation (flat-text prompt format)
+- `find` tool returns no results in standalone pi on Windows
