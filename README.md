@@ -1,6 +1,6 @@
 # pi-claude-cli
 
-> **Why this fork.** Anthropic recommends `--effort xhigh` as the level for Opus 4.7 coding, but upstream [`rchern/pi-claude-cli`](https://github.com/rchern/pi-claude-cli) never sends `--effort xhigh` to Claude Code at all. On Opus models it silently promotes Pi `xhigh` to `--effort max`; on Sonnet/Haiku it caps at `--effort high`. Either way, Pi users can't actually reach the CLI level Anthropic recommends. This fork makes the mapping truthful (Pi `xhigh` on Opus 4.7+ → CLI `xhigh`) and keeps `max` reachable via an opt-in env var. See [Thinking effort](#thinking-effort) for the full table.
+> **Why this fork.** Anthropic recommends Claude Code `--effort xhigh` for Opus 4.7 coding. Upstream [`rchern/pi-claude-cli`](https://github.com/rchern/pi-claude-cli) never sends that level: Pi `xhigh` becomes `max` on Opus and `high` elsewhere. This fork maps Opus 4.7+ `xhigh` to `xhigh`, with opt-in `max` for rare cases. See [Thinking effort](#thinking-effort) for details.
 
 A [pi](https://github.com/mariozechner/pi-coding-agent) extension that routes LLM calls through the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as a subprocess. Use your Claude Pro/Max subscription as the LLM backend — no API key, no separate billing.
 
