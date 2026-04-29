@@ -36,10 +36,16 @@ type TrackedBlock = TrackedContentBlock | TrackedToolBlock;
  * handleEvent processes each Claude API streaming event and pushes
  * the appropriate pi events to the stream.
  * getOutput returns the accumulated AssistantMessage.
+ * finalize closes out any tool_use blocks that never received a
+ * content_block_stop event (e.g. when the CLI subprocess is killed
+ * mid-stream by the inactivity timeout, an abort, or an upstream
+ * truncation), so the captured tool call carries the partial args
+ * we did receive instead of the initial empty {} placeholder.
  */
 export interface EventBridge {
   handleEvent(event: ClaudeApiEvent): void;
   getOutput(): AssistantMessage;
+  finalize(): void;
 }
 
 /**
@@ -322,36 +328,57 @@ export function createEventBridge(
         partial: output,
       });
     } else if (block.type === "tool_use") {
-      // Final JSON parse with fallback to raw string
-      let finalArgs: Record<string, unknown> | string;
-      try {
-        const parsed = JSON.parse(block.partialJson);
-        finalArgs = translateClaudeArgsToPi(block.claudeName, parsed);
-      } catch {
-        finalArgs = block.partialJson;
-      }
-
-      // Update output.content with final arguments
-      const contentBlock = output.content[idx] as ToolCall;
-      (contentBlock as any).arguments = finalArgs;
-
-      // ToolCall.arguments is typed as Record<string, any> in pi-ai, but we
-      // intentionally emit a raw string when JSON parse fails completely.
-      // Pi handles string arguments gracefully at runtime.
-      const toolCall = {
-        type: "toolCall" as const,
-        id: block.id,
-        name: block.name,
-        arguments: finalArgs,
-      } as ToolCall;
-
-      stream.push({
-        type: "toolcall_end",
-        contentIndex: idx,
-        toolCall,
-        partial: output,
-      });
+      finalizeToolBlock(block, idx, /*emitEnd*/ true);
     }
+  }
+
+  /**
+   * Finalize a tool_use block: parse + translate the accumulated partial JSON
+   * and update output.content. Shared by content_block_stop (normal path) and
+   * finalize() (defensive close-out when the stream ended without a stop event
+   * for this block).
+   *
+   * `emitEnd` controls whether to push the toolcall_end stream event. The
+   * normal stop path emits it; the defensive finalize path skips it because
+   * the bridge consumer is reading getOutput() directly and pushing its own
+   * "done" event.
+   */
+  function finalizeToolBlock(
+    block: TrackedToolBlock,
+    idx: number,
+    emitEnd: boolean,
+  ): void {
+    // Final JSON parse with fallback to raw string
+    let finalArgs: Record<string, unknown> | string;
+    try {
+      const parsed = JSON.parse(block.partialJson);
+      finalArgs = translateClaudeArgsToPi(block.claudeName, parsed);
+    } catch {
+      finalArgs = block.partialJson;
+    }
+
+    // Update output.content with final arguments
+    const contentBlock = output.content[idx] as ToolCall;
+    (contentBlock as any).arguments = finalArgs;
+
+    if (!emitEnd) return;
+
+    // ToolCall.arguments is typed as Record<string, any> in pi-ai, but we
+    // intentionally emit a raw string when JSON parse fails completely.
+    // Pi handles string arguments gracefully at runtime.
+    const toolCall = {
+      type: "toolCall" as const,
+      id: block.id,
+      name: block.name,
+      arguments: finalArgs,
+    } as ToolCall;
+
+    stream.push({
+      type: "toolcall_end",
+      contentIndex: idx,
+      toolCall,
+      partial: output,
+    });
   }
 
   function handleMessageDelta(event: ClaudeApiEvent): void {
@@ -378,8 +405,35 @@ export function createEventBridge(
     // Pushing done here (synchronously) prevents pi from executing tools.
   }
 
+  /**
+   * Close out any tool_use blocks that never received a content_block_stop.
+   *
+   * The bridge initializes a tool_use block's `arguments` to `{}` at
+   * content_block_start and only writes the parsed/translated args to
+   * `output.content[idx]` when content_block_stop fires. If the upstream
+   * stream is truncated mid-tool-call (CLI subprocess killed, abort signal,
+   * inactivity timeout, network hiccup), the captured ToolCall would
+   * otherwise reach pi with `arguments: {}` — pi-ai's AJV validator then
+   * reports the unhelpful `Received arguments: {}` error and the model
+   * retries with no signal that its tool input was cut off.
+   *
+   * Safe to call multiple times. Blocks already finalized by
+   * content_block_stop have their tracking `index` deleted and are skipped.
+   */
+  function finalize(): void {
+    for (let idx = 0; idx < blocks.length; idx++) {
+      const block = blocks[idx];
+      // content_block_stop deletes `index`; presence means it never fired
+      if (block.type !== "tool_use") continue;
+      if ((block as any).index === undefined) continue;
+      delete (block as any).index;
+      finalizeToolBlock(block, idx, /*emitEnd*/ false);
+    }
+  }
+
   return {
     handleEvent,
     getOutput: () => output,
+    finalize,
   };
 }

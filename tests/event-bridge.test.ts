@@ -1241,4 +1241,164 @@ describe("createEventBridge", () => {
       expect(bridge.getOutput().usage.output).toBe(0);
     });
   });
+
+  // Regression: when the Claude CLI subprocess ends (timeout, abort, internal
+  // crash) without firing content_block_stop for an in-flight tool_use,
+  // bridge.getOutput() previously returned the tool call with arguments={}
+  // (the placeholder set at content_block_start). Pi-ai's AJV validator then
+  // rejected the call with the unhelpful "Received arguments: {}" error and
+  // the model retried blindly. finalize() runs the same parse+translate as
+  // content_block_stop so any partial input we did receive survives.
+  describe("finalize() closes out unfinished tool_use blocks", () => {
+    it("translates fully accumulated args when content_block_stop never fires", () => {
+      const bridge = createBridgeWithStart();
+      bridge.handleEvent({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_01ABC", name: "Write" },
+      });
+      bridge.handleEvent({
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "input_json_delta",
+          partial_json: '{"file_path":"/foo.ts","content":"hello"}',
+        },
+      });
+      // Note: no content_block_stop — simulates the CLI being SIGKILLed
+      // while the JSON has fully arrived but before the stop event.
+
+      bridge.finalize();
+
+      const toolCall = bridge.getOutput().content[0] as any;
+      // file_path → path translated, NOT left as initial {}
+      expect(toolCall.arguments).toEqual({
+        path: "/foo.ts",
+        content: "hello",
+      });
+    });
+
+    it("preserves the raw partial string when partialJson is unparseable", () => {
+      const bridge = createBridgeWithStart();
+      bridge.handleEvent({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_01ABC", name: "Write" },
+      });
+      bridge.handleEvent({
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "input_json_delta",
+          partial_json: '{"file_path":"/foo.ts","content":"hello, wo',
+        },
+      });
+      // Truncated mid-string — JSON.parse fails, we expose the partial.
+
+      bridge.finalize();
+
+      const toolCall = bridge.getOutput().content[0] as any;
+      expect(typeof toolCall.arguments).toBe("string");
+      expect(toolCall.arguments).toBe(
+        '{"file_path":"/foo.ts","content":"hello, wo',
+      );
+    });
+
+    it("is a no-op for tool_use blocks already finalized by content_block_stop", () => {
+      const bridge = createBridgeWithStart();
+      bridge.handleEvent({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_01ABC", name: "Read" },
+      });
+      bridge.handleEvent({
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "input_json_delta",
+          partial_json: '{"file_path":"/foo.ts"}',
+        },
+      });
+      bridge.handleEvent({ type: "content_block_stop", index: 0 });
+
+      const before = (bridge.getOutput().content[0] as any).arguments;
+      bridge.finalize();
+      const after = (bridge.getOutput().content[0] as any).arguments;
+
+      expect(after).toEqual(before);
+      expect(after).toEqual({ path: "/foo.ts" });
+    });
+
+    it("only finalizes tool_use blocks, leaves text/thinking blocks alone", () => {
+      const bridge = createBridgeWithStart();
+      bridge.handleEvent({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      });
+      bridge.handleEvent({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "partial reply" },
+      });
+      // No content_block_stop for the text block either, but finalize()
+      // should leave it alone — only tool_use blocks need argument repair.
+
+      expect(() => bridge.finalize()).not.toThrow();
+      const textBlock = bridge.getOutput().content[0] as any;
+      expect(textBlock.type).toBe("text");
+      expect(textBlock.text).toBe("partial reply");
+    });
+
+    it("is safe to call multiple times", () => {
+      const bridge = createBridgeWithStart();
+      bridge.handleEvent({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_01ABC", name: "Write" },
+      });
+      bridge.handleEvent({
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "input_json_delta",
+          partial_json: '{"file_path":"/foo.ts","content":"hi"}',
+        },
+      });
+
+      bridge.finalize();
+      const first = (bridge.getOutput().content[0] as any).arguments;
+      bridge.finalize();
+      const second = (bridge.getOutput().content[0] as any).arguments;
+
+      expect(first).toEqual({ path: "/foo.ts", content: "hi" });
+      expect(second).toEqual(first);
+    });
+
+    it("does not push a toolcall_end stream event (provider drives done)", () => {
+      const bridge = createBridgeWithStart();
+      bridge.handleEvent({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_01ABC", name: "Write" },
+      });
+      bridge.handleEvent({
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "input_json_delta",
+          partial_json: '{"file_path":"/foo.ts","content":"hi"}',
+        },
+      });
+      stream.push.mockClear();
+      stream.events.length = 0;
+
+      bridge.finalize();
+
+      // The defensive close-out repairs output.content but does not emit a
+      // toolcall_end — the provider pushes its own "done" event with the
+      // repaired AssistantMessage.
+      expect(stream.push).not.toHaveBeenCalled();
+    });
+  });
 });
