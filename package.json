@@ -17,14 +17,16 @@
   },
   "license": "MIT",
   "peerDependencies": {
-    "@mariozechner/pi-ai": "^0.52.0",
-    "@mariozechner/pi-coding-agent": "^0.52.0"
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
   },
   "dependencies": {
     "cross-spawn": "^7.0.6"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
+    "@mariozechner/pi-ai": "^0.70.6",
+    "@mariozechner/pi-coding-agent": "^0.70.6",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^3.2.4",
@@ -53,5 +55,13 @@
     "lint": "eslint .",
     "format:check": "prettier --check .",
     "prepare": "command -v husky >/dev/null 2>&1 && husky || true"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-ai": {
+      "optional": true
+    },
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    }
   }
 }
