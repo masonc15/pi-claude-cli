@@ -12,11 +12,11 @@ The extension registers as a custom pi provider exposing all Claude models. Each
 
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude` on PATH). Version 2.1.123 or newer is recommended; earlier versions may not accept all `--effort` levels documented below.
 - A Claude Pro or Max subscription
-- [pi](https://github.com/mariozechner/pi-coding-agent) or [GSD](https://github.com/gsd-build/gsd-2)
+- [pi](https://github.com/mariozechner/pi-coding-agent)
 
 ## Installation
 
-Add to `~/.gsd/agent/settings.json`:
+Add to `~/.pi/agent/settings.json`:
 
 ```json
 {
