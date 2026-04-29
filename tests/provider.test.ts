@@ -2135,6 +2135,98 @@ describe("streamViaCli", () => {
       await vi.advanceTimersByTimeAsync(100);
     });
 
+    it("does NOT pass --resume when last assistant carries a truncation notice", async () => {
+      // Regression: codex-review caught that a repaired truncation notice
+      // never reaches the model when the next turn uses --resume, because
+      // buildResumePrompt only forwards trailing tool results plus the new
+      // user message. The CLI's session file does not contain our synthetic
+      // notice, so the model would retry the same oversized tool call. Force
+      // a non-resume turn so buildPrompt re-flattens the full pi history
+      // (notice text included) into the prompt.
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "Make a playground" },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "Building the playground now." },
+              {
+                type: "text",
+                text:
+                  "[pi-claude-cli notice] Tool call was cut off mid-stream " +
+                  "before the arguments finished generating. Partial input " +
+                  'captured: write({"file_path":"/Users/colin/big.html"})',
+              },
+            ],
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
+          { role: "user", content: "try again" },
+        ],
+      };
+
+      streamViaCli(model, context, { sessionId: "sess-truncated" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).not.toContain("--resume");
+      // Still passes --session-id so a fresh CLI session is created (and
+      // future non-truncated turns can resume against it).
+      expect(args).toContain("--session-id");
+      const sessIdx = args.indexOf("--session-id");
+      expect(args[sessIdx + 1]).toBe("sess-truncated");
+
+      // Clean up
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("DOES resume when an OLDER assistant turn had a truncation notice but the latest one did not", async () => {
+      // Only the most recent assistant message gates resume — once the
+      // model has already received and acknowledged the notice in a
+      // subsequent fresh turn, the next turn can resume normally.
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "Make a playground" },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "text",
+                text: "[pi-claude-cli notice] Tool call was cut off mid-stream.",
+              },
+            ],
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
+          { role: "user", content: "ok try smaller chunks" },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "Sure, splitting into 3 Write calls." },
+            ],
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
+          { role: "user", content: "go" },
+        ],
+      };
+
+      streamViaCli(model, context, { sessionId: "sess-recovered" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).toContain("--resume");
+
+      // Clean up
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
     it("resumes when the LAST assistant message is pi-claude-cli even if earlier ones are not", async () => {
       // User switched away then back. Most recent assistant turn was
       // pi-claude-cli, so the on-disk Claude CLI session is fresh.

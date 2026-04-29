@@ -56,6 +56,14 @@ const INACTIVITY_TIMEOUT_MS = 360_000;
 const PI_CLAUDE_CLI_PROVIDER_ID = "pi-claude-cli";
 
 /**
+ * Marker prefix on repair-notice text blocks. Used both to identify the
+ * notice in pi's persisted history (so the next turn skips `--resume` and
+ * rebuilds the full prompt — the CLI's own session file does not contain
+ * this synthetic block) and to make the notice greppable in pi's logs.
+ */
+const TRUNCATION_NOTICE_MARKER = "[pi-claude-cli notice]";
+
+/**
  * Detect tool calls whose `arguments` is a string instead of an object.
  *
  * EventBridge.finalize() falls back to the raw partialJson string when a
@@ -121,8 +129,8 @@ function repairTruncatedToolCalls<T extends { content?: unknown[] }>(
   repaired.push({
     type: "text",
     text:
-      `[pi-claude-cli notice] Tool call was cut off mid-stream before the ` +
-      `arguments finished generating. Partial input captured: ${summary}. ` +
+      `${TRUNCATION_NOTICE_MARKER} Tool call was cut off mid-stream before ` +
+      `the arguments finished generating. Partial input captured: ${summary}. ` +
       `The CLI subprocess ended before emitting content_block_stop — ` +
       `most likely the response exceeded the model's output token budget ` +
       `(xhigh thinking can consume most of it) or the upstream stream ` +
@@ -158,6 +166,37 @@ function lastAssistantWasViaThisExtension(messages: any[]): boolean {
     return (
       m.provider === PI_CLAUDE_CLI_PROVIDER_ID ||
       m.api === PI_CLAUDE_CLI_PROVIDER_ID
+    );
+  }
+  return false;
+}
+
+/**
+ * Detect whether the most recent assistant message contains a truncation
+ * repair notice (a text block emitted by `repairTruncatedToolCalls`).
+ *
+ * When this is true the next turn must NOT use `--resume`. The Claude CLI's
+ * persisted session file only sees what the CLI itself recorded for the
+ * killed turn (typically a stub like "No response requested.") — it never
+ * received our synthetic notice or the partial tool args. If we resumed,
+ * `buildResumePrompt` would only forward trailing tool results plus the new
+ * user message, so the model would never see the explanation and would
+ * retry the same oversized tool call blindly.
+ *
+ * Falling back to a fresh CLI session re-flattens the full pi history
+ * (including the notice text) into the prompt via `buildPrompt`, so the
+ * model sees what happened and can switch strategy.
+ */
+function lastAssistantHasTruncationNotice(messages: any[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    if (!Array.isArray(m.content)) return false;
+    return m.content.some(
+      (b: any) =>
+        b?.type === "text" &&
+        typeof b.text === "string" &&
+        b.text.includes(TRUNCATION_NOTICE_MARKER),
     );
   }
   return false;
@@ -210,10 +249,16 @@ export function streamViaCli(
       // mid-session), Claude CLI has no matching session file and `--resume`
       // produces an empty response with zero tokens. Falling back to a fresh
       // call rebuilds the full conversation history into the prompt instead.
+      //
+      // Also skip resume when the last assistant turn carries a truncation
+      // repair notice — the CLI's session file does not contain that
+      // synthetic block, so resuming would hide the notice from the model
+      // and the next turn would retry the same oversized tool call.
       const resumeSessionId =
         options?.sessionId &&
         context.messages.length > 1 &&
-        lastAssistantWasViaThisExtension(context.messages)
+        lastAssistantWasViaThisExtension(context.messages) &&
+        !lastAssistantHasTruncationNotice(context.messages)
           ? options.sessionId
           : undefined;
 
