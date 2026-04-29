@@ -1838,12 +1838,17 @@ describe("streamViaCli", () => {
   });
 
   describe("session resume via options.sessionId", () => {
-    it("passes --resume when sessionId option is provided on subsequent turn", async () => {
+    it("passes --resume when sessionId option is provided on subsequent turn (prior assistant via pi-claude-cli)", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [
           { role: "user", content: "Hello" },
-          { role: "assistant", content: "Hi" },
+          {
+            role: "assistant",
+            content: "Hi",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
           { role: "user", content: "Follow-up" },
         ],
       };
@@ -1855,6 +1860,99 @@ describe("streamViaCli", () => {
       expect(args).toContain("--resume");
       const idx = args.indexOf("--resume");
       expect(args[idx + 1]).toBe("sess-abc-123");
+
+      // Clean up
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("does NOT pass --resume when prior assistant turn was via a different provider", async () => {
+      // Cross-provider switch: user started with another provider, then
+      // switched to pi-claude-cli. Claude CLI has no matching session file.
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "Hello" },
+          {
+            role: "assistant",
+            content: "Hi from gemini",
+            provider: "google",
+            api: "google-generative-ai",
+          },
+          { role: "user", content: "Follow-up via claude" },
+        ],
+      };
+
+      streamViaCli(model, context, { sessionId: "sess-abc-123" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).not.toContain("--resume");
+      // Falls back to fresh send: --session-id (so future turns can resume)
+      // and full system prompt.
+      expect(args).toContain("--session-id");
+      const sessIdx = args.indexOf("--session-id");
+      expect(args[sessIdx + 1]).toBe("sess-abc-123");
+
+      // Clean up
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("does NOT pass --resume when there is no prior assistant turn at all", async () => {
+      // History contains only user messages (e.g. if the previous assistant
+      // turn was filtered out for some reason). No CLI session exists yet.
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "first" },
+          { role: "user", content: "second" },
+        ],
+      };
+
+      streamViaCli(model, context, { sessionId: "sess-abc-123" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).not.toContain("--resume");
+
+      // Clean up
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("resumes when the LAST assistant message is pi-claude-cli even if earlier ones are not", async () => {
+      // User switched away then back. Most recent assistant turn was
+      // pi-claude-cli, so the on-disk Claude CLI session is fresh.
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "q1" },
+          {
+            role: "assistant",
+            content: "a1 from gemini",
+            provider: "google",
+            api: "google-generative-ai",
+          },
+          { role: "user", content: "q2" },
+          {
+            role: "assistant",
+            content: "a2 from claude",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
+          { role: "user", content: "q3" },
+        ],
+      };
+
+      streamViaCli(model, context, { sessionId: "sess-back" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).toContain("--resume");
 
       // Clean up
       const proc = (spawn as any).mock.results[0].value;
@@ -1907,7 +2005,12 @@ describe("streamViaCli", () => {
       const context = {
         messages: [
           { role: "user", content: "first message" },
-          { role: "assistant", content: "response" },
+          {
+            role: "assistant",
+            content: "response",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
           { role: "user", content: "follow-up" },
         ],
       };
@@ -1931,7 +2034,12 @@ describe("streamViaCli", () => {
       const context = {
         messages: [
           { role: "user", content: "Hello" },
-          { role: "assistant", content: "Hi" },
+          {
+            role: "assistant",
+            content: "Hi",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
           { role: "user", content: "follow-up" },
         ],
         systemPrompt: "Be helpful",
