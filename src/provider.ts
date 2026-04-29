@@ -42,6 +42,38 @@ import { isPiKnownClaudeTool } from "./tool-mapping.js";
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
 
+/** Pi provider id this extension registers under. Used to detect whether a
+ *  prior assistant turn went through this extension and therefore left a
+ *  Claude CLI session file on disk that we can `--resume`. */
+const PI_CLAUDE_CLI_PROVIDER_ID = "pi-claude-cli";
+
+/**
+ * Determine whether the most recent assistant turn in `messages` went through
+ * this extension. Pi attaches `provider` and `api` to every assistant message
+ * (see `AssistantMessage` in @mariozechner/pi-ai), so we can scan backwards
+ * for the last assistant entry and check.
+ *
+ * Returns false when the last assistant turn was from a different provider
+ * (e.g. user switched mid-session from `kimi-coding` to `pi-claude-cli`),
+ * because Claude CLI has no session file matching pi's session id and
+ * `--resume <id>` would silently produce an empty response.
+ *
+ * Returns false when there is no prior assistant turn at all — caller should
+ * already gate on `context.messages.length > 1`, but this is the safer answer
+ * either way.
+ */
+function lastAssistantWasViaThisExtension(messages: any[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    return (
+      m.provider === PI_CLAUDE_CLI_PROVIDER_ID ||
+      m.api === PI_CLAUDE_CLI_PROVIDER_ID
+    );
+  }
+  return false;
+}
+
 /** Extended stream options: pi's SimpleStreamOptions plus optional cwd and mcpConfigPath */
 type StreamViaCLiOptions = SimpleStreamOptions & {
   cwd?: string;
@@ -81,11 +113,18 @@ export function streamViaCli(
     try {
       const cwd = options?.cwd ?? process.cwd();
 
-      // Resume if pi provides a session ID AND this isn't the first turn.
-      // Pi passes sessionId on every call (including first), but we can only
-      // --resume a CLI session that already exists on disk from a prior turn.
+      // Resume only if pi provides a session ID AND a prior assistant turn in
+      // this conversation went through pi-claude-cli. Pi passes sessionId on
+      // every call (including the first), but we can only --resume a Claude
+      // CLI session that already exists on disk; if the most recent assistant
+      // turn went through a different provider (e.g. the user switched models
+      // mid-session), Claude CLI has no matching session file and `--resume`
+      // produces an empty response with zero tokens. Falling back to a fresh
+      // call rebuilds the full conversation history into the prompt instead.
       const resumeSessionId =
-        options?.sessionId && context.messages.length > 1
+        options?.sessionId &&
+        context.messages.length > 1 &&
+        lastAssistantWasViaThisExtension(context.messages)
           ? options.sessionId
           : undefined;
 
