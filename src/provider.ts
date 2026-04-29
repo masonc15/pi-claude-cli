@@ -180,6 +180,9 @@ export function streamViaCli(
       function endStreamWithError(errMsg: string) {
         if (streamEnded || broken) return;
         streamEnded = true;
+        // Close out any in-flight tool_use blocks so partial args are not
+        // dropped when the stream ends without a content_block_stop.
+        bridge.finalize();
         const output = bridge.getOutput();
         const errorMessage = {
           ...output,
@@ -329,6 +332,9 @@ export function streamViaCli(
       // inside handleMessageStop prevents pi from executing tools.
       // Guard with streamEnded to avoid pushing done after an error was already pushed.
       if (!streamEnded) {
+        // Close out any in-flight tool_use blocks so partial args are not
+        // dropped when the stream ends without a content_block_stop.
+        bridge.finalize();
         const output = bridge.getOutput();
 
         // If stopReason is toolUse but there are no pi-known tool calls in content,
