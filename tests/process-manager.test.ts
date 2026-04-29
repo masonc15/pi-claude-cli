@@ -146,6 +146,15 @@ describe("effort flag", () => {
     expect(args[idx + 1]).toBe("max");
   });
 
+  it("includes --effort and xhigh in args when effort is xhigh (Opus 4.7+ default)", () => {
+    spawnClaude("claude-opus-4-7", undefined, { effort: "xhigh" });
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--effort");
+    const idx = args.indexOf("--effort");
+    expect(args[idx + 1]).toBe("xhigh");
+  });
+
   it("includes --effort and low in args when effort is low", () => {
     spawnClaude("claude-sonnet-4-5-20250929", undefined, { effort: "low" });
     const args = (spawn as any).mock.calls[0][1] as string[];

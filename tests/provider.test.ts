@@ -51,6 +51,17 @@ const mockModels = [
     contextWindow: 200000,
     maxTokens: 16384,
   },
+  {
+    id: "claude-opus-4-7",
+    name: "Claude Opus 4.7",
+    api: "anthropic",
+    provider: "anthropic",
+    reasoning: true,
+    input: "text",
+    cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+    contextWindow: 200000,
+    maxTokens: 16384,
+  },
 ];
 
 const { MockAssistantMessageEventStream } = vi.hoisted(() => {
@@ -422,20 +433,60 @@ describe("streamViaCli", () => {
       expect(args[idx + 1]).toBe("high");
     });
 
-    it("passes elevated effort to spawnClaude when options.reasoning is provided on Opus model", async () => {
-      const model = mockModels[1] as any; // opus
+    it("caps xhigh at high on non-Opus models", async () => {
+      const model = mockModels[0] as any; // sonnet
       const context = {
-        messages: [{ role: "user", content: "Think about this" }],
+        messages: [{ role: "user", content: "Think hard" }],
+      };
+
+      streamViaCli(model, context, { reasoning: "xhigh" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      const idx = args.indexOf("--effort");
+      expect(args[idx + 1]).toBe("high");
+    });
+
+    it("caps xhigh at high on pre-4.7 Opus models (truthful, conservative)", async () => {
+      const model = mockModels[1] as any; // opus 4.6
+      const context = {
+        messages: [{ role: "user", content: "Think hard" }],
+      };
+
+      streamViaCli(model, context, { reasoning: "xhigh" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      const idx = args.indexOf("--effort");
+      expect(args[idx + 1]).toBe("high");
+    });
+
+    it("sends --effort xhigh on Opus 4.7+ when reasoning is xhigh (truthful 1:1)", async () => {
+      const model = mockModels[2] as any; // opus 4.7
+      const context = {
+        messages: [{ role: "user", content: "Think hard" }],
+      };
+
+      streamViaCli(model, context, { reasoning: "xhigh" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      const idx = args.indexOf("--effort");
+      expect(args[idx + 1]).toBe("xhigh");
+    });
+
+    it("sends --effort high on Opus 4.7+ when reasoning is high (no longer elevated)", async () => {
+      const model = mockModels[2] as any; // opus 4.7
+      const context = {
+        messages: [{ role: "user", content: "Think" }],
       };
 
       streamViaCli(model, context, { reasoning: "high" } as any);
       await vi.advanceTimersByTimeAsync(0);
 
-      // Opus "high" should map to "max"
       const args = (spawn as any).mock.calls[0][1] as string[];
-      expect(args).toContain("--effort");
       const idx = args.indexOf("--effort");
-      expect(args[idx + 1]).toBe("max");
+      expect(args[idx + 1]).toBe("high");
     });
 
     it("does not pass effort when reasoning is undefined", async () => {
@@ -465,8 +516,8 @@ describe("streamViaCli", () => {
       expect(args[idx + 1]).toBe("medium");
     });
 
-    it("passes high effort for medium reasoning on Opus (elevated)", async () => {
-      const model = mockModels[1] as any; // opus
+    it("passes medium effort for medium reasoning on Opus 4.6 (truthful, no longer elevated)", async () => {
+      const model = mockModels[1] as any; // opus 4.6
       const context = {
         messages: [{ role: "user", content: "Think" }],
       };
@@ -476,7 +527,7 @@ describe("streamViaCli", () => {
 
       const args = (spawn as any).mock.calls[0][1] as string[];
       const idx = args.indexOf("--effort");
-      expect(args[idx + 1]).toBe("high");
+      expect(args[idx + 1]).toBe("medium");
     });
   });
 
