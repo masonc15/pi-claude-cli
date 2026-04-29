@@ -39,13 +39,110 @@ import { createEventBridge } from "./event-bridge.js";
 import { handleControlRequest } from "./control-handler.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
-/** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
-const INACTIVITY_TIMEOUT_MS = 180_000;
+/**
+ * Inactivity timeout: kill the subprocess if no stdout for this long.
+ *
+ * Six minutes is generous because Opus 4.7 with `--effort xhigh` regularly
+ * spends 3+ minutes generating a single response (interleaved thinking +
+ * tool input streaming), and one upstream stall during that response should
+ * not nuke the whole turn. The timer resets on every line of stdout, so
+ * actively-streaming responses never trip it.
+ */
+const INACTIVITY_TIMEOUT_MS = 360_000;
 
 /** Pi provider id this extension registers under. Used to detect whether a
  *  prior assistant turn went through this extension and therefore left a
  *  Claude CLI session file on disk that we can `--resume`. */
 const PI_CLAUDE_CLI_PROVIDER_ID = "pi-claude-cli";
+
+/**
+ * Marker prefix on repair-notice text blocks. Used both to identify the
+ * notice in pi's persisted history (so the next turn skips `--resume` and
+ * rebuilds the full prompt — the CLI's own session file does not contain
+ * this synthetic block) and to make the notice greppable in pi's logs.
+ */
+const TRUNCATION_NOTICE_MARKER = "[pi-claude-cli notice]";
+
+/**
+ * Detect tool calls whose `arguments` is a string instead of an object.
+ *
+ * EventBridge.finalize() falls back to the raw partialJson string when a
+ * tool_use block ends without a parseable JSON object — typically because
+ * the upstream Claude CLI stream truncated mid-tool-input (inactivity
+ * timeout, upstream stall, output token budget exhausted by xhigh thinking).
+ * Pi-ai's AJV validator then rejects the call with "must be object" and the
+ * model retries blindly with no signal that its tool input was cut off.
+ *
+ * To make the failure actionable, replace each truncated tool_use block with
+ * a text block describing what happened and what was captured, log a warning
+ * to pi's console, and force stopReason to "stop" so pi treats it as a
+ * normal text response. The model sees the explanation in its next-turn
+ * context and can switch strategy (smaller payload, Bash heredoc, etc.).
+ *
+ * Returns the (possibly modified) AssistantMessage and a flag indicating
+ * whether any truncation was detected. Idempotent and safe on messages with
+ * no tool calls.
+ */
+function repairTruncatedToolCalls<T extends { content?: unknown[] }>(
+  message: T,
+): { message: T; truncated: boolean } {
+  const content = message.content;
+  if (!Array.isArray(content) || content.length === 0) {
+    return { message, truncated: false };
+  }
+
+  const partial: Array<{ name: string; partial: string }> = [];
+  const repaired: unknown[] = [];
+
+  for (const block of content) {
+    const b = block as any;
+    if (b?.type === "toolCall" && typeof b.arguments === "string") {
+      partial.push({
+        name: String(b.name ?? "unknown"),
+        partial: b.arguments,
+      });
+      continue; // drop the malformed tool_use; replaced with a text block below
+    }
+    repaired.push(block);
+  }
+
+  if (partial.length === 0) {
+    return { message, truncated: false };
+  }
+
+  const summary = partial
+    .map((p) => {
+      const head =
+        p.partial.length > 200 ? p.partial.slice(0, 200) + "…" : p.partial;
+      return `${p.name}(${head})`;
+    })
+    .join("; ");
+
+  console.warn(
+    `[pi-claude-cli] Stream truncated mid-tool-call: ${partial.length} tool ` +
+      `block(s) had unparseable JSON args after the bridge finalized. The Claude ` +
+      `CLI subprocess ended before content_block_stop fired for these blocks. ` +
+      `Likely causes: inactivity timeout, upstream API stall, or output token ` +
+      `budget exhausted by xhigh thinking. Partial input captured: ${summary}`,
+  );
+
+  repaired.push({
+    type: "text",
+    text:
+      `${TRUNCATION_NOTICE_MARKER} Tool call was cut off mid-stream before ` +
+      `the arguments finished generating. Partial input captured: ${summary}. ` +
+      `The CLI subprocess ended before emitting content_block_stop — ` +
+      `most likely the response exceeded the model's output token budget ` +
+      `(xhigh thinking can consume most of it) or the upstream stream ` +
+      `stalled. Try a smaller payload: write the file via Bash heredoc ` +
+      `or split the content across multiple smaller Write calls.`,
+  });
+
+  return {
+    message: { ...message, content: repaired } as T,
+    truncated: true,
+  };
+}
 
 /**
  * Determine whether the most recent assistant turn in `messages` went through
@@ -74,6 +171,37 @@ function lastAssistantWasViaThisExtension(messages: any[]): boolean {
   return false;
 }
 
+/**
+ * Detect whether the most recent assistant message contains a truncation
+ * repair notice (a text block emitted by `repairTruncatedToolCalls`).
+ *
+ * When this is true the next turn must NOT use `--resume`. The Claude CLI's
+ * persisted session file only sees what the CLI itself recorded for the
+ * killed turn (typically a stub like "No response requested.") — it never
+ * received our synthetic notice or the partial tool args. If we resumed,
+ * `buildResumePrompt` would only forward trailing tool results plus the new
+ * user message, so the model would never see the explanation and would
+ * retry the same oversized tool call blindly.
+ *
+ * Falling back to a fresh CLI session re-flattens the full pi history
+ * (including the notice text) into the prompt via `buildPrompt`, so the
+ * model sees what happened and can switch strategy.
+ */
+function lastAssistantHasTruncationNotice(messages: any[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    if (!Array.isArray(m.content)) return false;
+    return m.content.some(
+      (b: any) =>
+        b?.type === "text" &&
+        typeof b.text === "string" &&
+        b.text.includes(TRUNCATION_NOTICE_MARKER),
+    );
+  }
+  return false;
+}
+
 /** Extended stream options: pi's SimpleStreamOptions plus optional cwd and mcpConfigPath */
 type StreamViaCLiOptions = SimpleStreamOptions & {
   cwd?: string;
@@ -88,7 +216,7 @@ type StreamViaCLiOptions = SimpleStreamOptions & {
  * at message_stop, if any built-in or custom-tools MCP tool was seen, kills
  * the subprocess before Claude CLI can auto-execute the tools.
  *
- * Hardened with: inactivity timeout (180s), subprocess exit handler with stderr
+ * Hardened with: inactivity timeout (360s), subprocess exit handler with stderr
  * surfacing, streamEnded guard against double errors, abort via SIGKILL, and
  * process registry integration for teardown cleanup.
  *
@@ -121,10 +249,16 @@ export function streamViaCli(
       // mid-session), Claude CLI has no matching session file and `--resume`
       // produces an empty response with zero tokens. Falling back to a fresh
       // call rebuilds the full conversation history into the prompt instead.
+      //
+      // Also skip resume when the last assistant turn carries a truncation
+      // repair notice — the CLI's session file does not contain that
+      // synthetic block, so resuming would hide the notice from the model
+      // and the next turn would retry the same oversized tool call.
       const resumeSessionId =
         options?.sessionId &&
         context.messages.length > 1 &&
-        lastAssistantWasViaThisExtension(context.messages)
+        lastAssistantWasViaThisExtension(context.messages) &&
+        !lastAssistantHasTruncationNotice(context.messages)
           ? options.sessionId
           : undefined;
 
@@ -184,17 +318,18 @@ export function streamViaCli(
         // dropped when the stream ends without a content_block_stop.
         bridge.finalize();
         const output = bridge.getOutput();
-        const errorMessage = {
+        const baseContent = output.content?.length
+          ? output.content
+          : [{ type: "text" as const, text: `Error: ${errMsg}` }];
+        const repaired = repairTruncatedToolCalls({
           ...output,
-          content: output.content?.length
-            ? output.content
-            : [{ type: "text" as const, text: `Error: ${errMsg}` }],
+          content: baseContent,
           stopReason: "stop" as const,
-        };
+        });
         stream.push({
           type: "done",
           reason: "stop",
-          message: errorMessage,
+          message: repaired.message,
         } as any);
         stream.end();
       }
@@ -337,14 +472,25 @@ export function streamViaCli(
         bridge.finalize();
         const output = bridge.getOutput();
 
-        // If stopReason is toolUse but there are no pi-known tool calls in content,
-        // it means only user MCP tools were called (filtered by event bridge).
+        // Convert any truncated tool_use blocks (string-valued args from
+        // finalize fallback) into a text notice the model can see and act
+        // on. `truncated` lets us downgrade stopReason to "stop" so pi
+        // doesn't try to execute the dropped tool call.
+        const repaired = repairTruncatedToolCalls({
+          ...output,
+          stopReason: output.stopReason,
+        });
+
+        // If stopReason is toolUse but there are no pi-known tool calls in
+        // content, it means only user MCP tools were called (filtered by
+        // event bridge) OR every tool_use was truncated and stripped above.
         // Override to "stop" so pi doesn't try to execute non-existent tools.
-        const piToolCalls = (output.content || []).filter(
+        const piToolCalls = (repaired.message.content || []).filter(
           (c: any) => c.type === "toolCall",
         );
         const effectiveReason =
-          output.stopReason === "toolUse" && piToolCalls.length === 0
+          repaired.truncated ||
+          (output.stopReason === "toolUse" && piToolCalls.length === 0)
             ? "stop"
             : output.stopReason;
 
@@ -357,7 +503,7 @@ export function streamViaCli(
               : effectiveReason === "length"
                 ? "length"
                 : "stop",
-          message: { ...output, stopReason: effectiveReason },
+          message: { ...repaired.message, stopReason: effectiveReason },
         });
         stream.end();
       }
