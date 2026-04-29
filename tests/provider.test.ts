@@ -1343,7 +1343,7 @@ describe("streamViaCli", () => {
   });
 
   describe("inactivity timeout", () => {
-    it("kills subprocess and pushes error after 180s of no output", async () => {
+    it("kills subprocess and pushes error after 360s of no output", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [{ role: "user", content: "Hello" }],
@@ -1354,8 +1354,10 @@ describe("streamViaCli", () => {
 
       const proc = (spawn as any).mock.results[0].value;
 
-      // Advance timers by 180 seconds without writing to stdout
-      await vi.advanceTimersByTimeAsync(180_000);
+      // Advance timers by the inactivity timeout (360s) without writing
+      // to stdout. Opus 4.7 with --effort xhigh routinely streams for
+      // 3+ minutes per turn, so the threshold was raised from 180s.
+      await vi.advanceTimersByTimeAsync(360_000);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
       const doneEvent = mockStream._events.find(
@@ -1381,8 +1383,8 @@ describe("streamViaCli", () => {
 
       const proc = (spawn as any).mock.results[0].value;
 
-      // Advance to 170s then write a line
-      await vi.advanceTimersByTimeAsync(170_000);
+      // Advance to 350s (just under the 360s timeout) then write a line
+      await vi.advanceTimersByTimeAsync(350_000);
 
       // Write a stream event line
       proc.stdout.write(
@@ -1396,8 +1398,8 @@ describe("streamViaCli", () => {
       );
       await vi.advanceTimersByTimeAsync(0);
 
-      // Advance another 170s (340s total, 170s since last line) -- should NOT timeout
-      await vi.advanceTimersByTimeAsync(170_000);
+      // Advance another 350s (700s total, 350s since last line) -- should NOT timeout
+      await vi.advanceTimersByTimeAsync(350_000);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
       const doneEvent = mockStream._events.find(
@@ -1405,7 +1407,7 @@ describe("streamViaCli", () => {
       );
       expect(doneEvent).toBeUndefined();
 
-      // Advance 10 more seconds (180s since last line) -- NOW should timeout
+      // Advance 10 more seconds (360s since last line) -- NOW should timeout
       await vi.advanceTimersByTimeAsync(10_000);
 
       const doneEvent2 = mockStream._events.find(
@@ -1451,14 +1453,223 @@ describe("streamViaCli", () => {
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
 
-      // Advance past 180s -- should NOT timeout since result was received
-      await vi.advanceTimersByTimeAsync(180_000);
+      // Advance past 360s -- should NOT timeout since result was received
+      await vi.advanceTimersByTimeAsync(360_000);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
       const errorEvents = mockStream._events.filter(
         (e: any) => e.type === "error",
       );
       expect(errorEvents).toHaveLength(0);
+    });
+  });
+
+  // Regression: when the upstream stream truncates mid-tool-call (inactivity
+  // timeout, upstream stall, output token budget exhausted by xhigh thinking),
+  // EventBridge.finalize() falls back to surfacing the partial JSON as a
+  // string. Pi-ai's AJV validator then rejects with "must be object" and the
+  // model retries blindly. The provider should detect this and replace the
+  // malformed tool_use with a text notice that the model can act on.
+  describe("truncated tool_use repair", () => {
+    function emitTruncatedToolStream(proc: any) {
+      // Stream up to mid-args without content_block_stop or message_stop.
+      const lines = [
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 10, output_tokens: 0 } },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+              type: "tool_use",
+              id: "tool_1",
+              name: "Write",
+              input: {},
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "input_json_delta",
+              partial_json: '{"file_path":"/Users/colin/big.html"',
+            },
+          },
+        }),
+      ];
+      for (const line of lines) {
+        proc.stdout.write(line + "\n");
+      }
+    }
+
+    it("replaces truncated tool_use with a text notice in done message", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Make a playground" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      emitTruncatedToolStream(proc);
+      // Stream just ends without content_block_stop / message_stop.
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(doneEvent).toBeDefined();
+
+      const content = doneEvent.message.content as any[];
+      // No malformed toolCall blocks remain.
+      expect(content.find((c) => c.type === "toolCall")).toBeUndefined();
+      // A text notice describing the truncation was appended.
+      const notice = content.find(
+        (c) => c.type === "text" && /pi-claude-cli notice/i.test(c.text ?? ""),
+      );
+      expect(notice).toBeDefined();
+      expect(notice.text).toContain("Write");
+      expect(notice.text).toContain("/Users/colin/big.html");
+      // stopReason downgraded so pi does not try to execute the dropped tool.
+      expect(doneEvent.message.stopReason).toBe("stop");
+      expect(doneEvent.reason).toBe("stop");
+
+      // Warning logged so the failure is visible in pi's console.
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Stream truncated mid-tool-call"),
+      );
+      warn.mockRestore();
+    });
+
+    it("leaves well-formed tool_use blocks untouched", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Read a file" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      const lines = [
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 10, output_tokens: 0 } },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+              type: "tool_use",
+              id: "tool_1",
+              name: "Read",
+              input: {},
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "input_json_delta",
+              partial_json: '{"file_path":"/foo.ts"}',
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_stop", index: 0 },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_delta",
+            delta: { stop_reason: "tool_use" },
+            usage: { output_tokens: 5 },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "message_stop" },
+        }),
+      ];
+      for (const line of lines) {
+        proc.stdout.write(line + "\n");
+      }
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(doneEvent).toBeDefined();
+
+      const content = doneEvent.message.content as any[];
+      const toolCall = content.find((c) => c.type === "toolCall");
+      expect(toolCall).toBeDefined();
+      expect(toolCall.arguments).toEqual({ path: "/foo.ts" });
+      // No truncation notice or warning fired.
+      expect(
+        content.find(
+          (c) =>
+            c.type === "text" && /pi-claude-cli notice/i.test(c.text ?? ""),
+        ),
+      ).toBeUndefined();
+      expect(warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("Stream truncated mid-tool-call"),
+      );
+      warn.mockRestore();
+    });
+
+    it("repairs truncated tool_use even on the inactivity-timeout path", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Make a playground" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      emitTruncatedToolStream(proc);
+      // Don't end stdout; let the inactivity timer fire.
+      await vi.advanceTimersByTimeAsync(360_000);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(doneEvent).toBeDefined();
+      const content = doneEvent.message.content as any[];
+      expect(content.find((c) => c.type === "toolCall")).toBeUndefined();
+      expect(
+        content.find(
+          (c) =>
+            c.type === "text" && /pi-claude-cli notice/i.test(c.text ?? ""),
+        ),
+      ).toBeDefined();
+
+      // Clean up
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+      warn.mockRestore();
     });
   });
 
