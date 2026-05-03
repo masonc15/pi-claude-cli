@@ -369,6 +369,11 @@ describe("validateCliAuth", () => {
 describe("CLI flags", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS;
+  });
+
+  afterEach(() => {
+    delete process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS;
   });
 
   it("spawnClaude does NOT include --permission-mode or dontAsk in args", () => {
@@ -389,6 +394,25 @@ describe("CLI flags", () => {
   });
 
   it("disables Claude Code native slash commands and skills", () => {
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--disable-slash-commands");
+  });
+
+  it.each(["0", "false", "no", "off"])(
+    "omits --disable-slash-commands when PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS=%s",
+    (value) => {
+      process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS = value;
+      spawnClaude("claude-sonnet-4-5-20250929");
+      const args = (spawn as any).mock.calls[0][1] as string[];
+
+      expect(args).not.toContain("--disable-slash-commands");
+    },
+  );
+
+  it("keeps --disable-slash-commands for truthy PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS", () => {
+    process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS = "1";
     spawnClaude("claude-sonnet-4-5-20250929");
     const args = (spawn as any).mock.calls[0][1] as string[];
 

@@ -34,6 +34,14 @@ function useStrictMcpConfig(): boolean {
   return !["0", "false", "no", "off"].includes(value);
 }
 
+function useDisableSlashCommands(): boolean {
+  const raw = process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS;
+  if (raw === undefined) return true;
+
+  const value = raw.trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(value);
+}
+
 /**
  * Spawn a Claude CLI subprocess with all required flags for stream-json communication.
  *
@@ -68,8 +76,11 @@ export function spawnClaude(
     modelId,
     "--permission-prompt-tool",
     "stdio",
-    "--disable-slash-commands",
   ];
+
+  if (useDisableSlashCommands()) {
+    args.push("--disable-slash-commands");
+  }
 
   const settingSources = claudeSettingSources();
   if (settingSources) {
@@ -101,6 +112,11 @@ export function spawnClaude(
 
   const allowedTools =
     options?.allowedTools ?? extractAllowedClaudeTools(systemPrompt);
+  // Claude CLI 2.1.123 treats an explicitly empty --tools value as "allow no
+  // built-in tools". We rely on that when Pi advertises only custom/no tools;
+  // omitting --tools would let Claude Code fall back to its default built-ins.
+  // Keep this covered by unit/e2e tests because it is a CLI behavior contract,
+  // not a TypeScript-enforced invariant.
   if (allowedTools) {
     args.push("--tools", allowedTools.join(","));
   }

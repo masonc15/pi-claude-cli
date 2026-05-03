@@ -62,15 +62,16 @@ pi is the harness for prompts, skills, tools, and custom tool execution. To keep
 
 - `--setting-sources local` by default, which avoids user-level Claude Code plugins and hooks while preserving normal Claude Code auth
 - `--strict-mcp-config`, so Claude only sees the MCP config pi-claude-cli explicitly passes for custom pi tool schemas
-- `--tools <mapped built-ins>`, derived from pi's `Available tools:` section, so a read-only pi turn exposes Claude Code `Read` but not `Bash`, `Glob`, or unrelated native tools
+- `--tools <mapped built-ins>`, derived from pi's `Available tools:` section, so a read-only pi turn exposes Claude Code `Read` but not `Bash`, `Glob`, or unrelated native tools. When pi advertises no built-in tools, the extension passes an explicit empty `--tools` value so Claude Code does not re-enable its default built-ins.
 - `--disable-slash-commands`, so Claude Code native slash commands and native skills do not compete with Pi skills
 
 This matters for Pi skills. Pi lists skills as files and tells the model to load the listed `<location>` with `read`; Claude Code user plugins may instead inject native-skill instructions such as using the `Skill` tool. The isolation flags keep Opus focused on Pi's actual contract.
 
-Two environment variables can relax the defaults for debugging:
+Three environment variables can relax the defaults for debugging:
 
 - `PI_CLAUDE_CLI_SETTING_SOURCES=default` omits `--setting-sources`; any other non-empty value is passed directly, such as `user,project,local`.
 - `PI_CLAUDE_CLI_STRICT_MCP_CONFIG=0` (also accepts `false`/`no`/`off`) omits `--strict-mcp-config`.
+- `PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS=0` (also accepts `false`/`no`/`off`) omits `--disable-slash-commands` for debugging native Claude Code slash-command behavior. Leave this unset for normal pi usage.
 
 ## Thinking effort
 
