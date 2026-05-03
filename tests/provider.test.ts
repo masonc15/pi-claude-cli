@@ -1267,6 +1267,37 @@ describe("streamViaCli", () => {
       );
     });
 
+    it("waits for non-zero close after stdout closes before finalizing", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+
+      proc.stderr.emit("data", Buffer.from("fast crash"));
+      proc.stdout.end();
+      setTimeout(() => {
+        proc.emit("close", 2, null);
+      }, 0);
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
+      );
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.error.errorMessage).toContain(
+        "Claude CLI exited with code 2: fast crash",
+      );
+      expect(doneEvent).toBeUndefined();
+    });
+
     it("does not push error on normal close (code 0)", async () => {
       const model = mockModels[0] as any;
       const context = {

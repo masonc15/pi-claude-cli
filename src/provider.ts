@@ -245,6 +245,12 @@ export function streamViaCli(
     let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
     let streamEnded = false;
     let broken = false;
+    let resultReceived = false;
+    let processClosed = false;
+    let resolveProcessClose: () => void = () => {};
+    const processClosePromise = new Promise<void>((resolve) => {
+      resolveProcessClose = resolve;
+    });
 
     function emptyUsage(): AssistantMessage["usage"] {
       return {
@@ -375,13 +381,44 @@ export function streamViaCli(
       // Register in global process registry for teardown cleanup
       registerProcess(proc);
 
-      // Write user message to subprocess stdin
-      writeUserMessage(proc, prompt);
-
       // Create event bridge before installing lifecycle handlers so every
       // failure path can return a normal assistant-shaped error payload.
       const eventBridge = createEventBridge(stream, model);
       bridge = eventBridge;
+
+      // Track tool_use blocks for break-early decision at message_stop
+      let sawBuiltInOrCustomTool = false;
+
+      // Set up readline for line-by-line NDJSON parsing
+      const rl = createInterface({
+        input: proc.stdout!,
+        crlfDelay: Infinity,
+        terminal: false,
+      });
+
+      // Handle process error -- attach before stdin write so fast spawn
+      // failures cannot close before the provider sees them.
+      proc.on("error", (err: Error) => {
+        if (broken) return; // Break-early killed the process intentionally
+        const stderr = getStderr();
+        endStreamWithError(stderr || err.message);
+      });
+
+      // Handle subprocess close -- attach before stdin write so immediate
+      // CLI crashes are surfaced instead of becoming empty successful turns.
+      proc.on("close", (code: number | null, _signal: string | null) => {
+        processClosed = true;
+        resolveProcessClose();
+        clearTimeout(inactivityTimer);
+        if (broken) return; // Break-early kill, expected
+        if (code !== 0 && code !== null) {
+          const stderr = getStderr();
+          const message = stderr
+            ? `Claude CLI exited with code ${code}: ${stderr.trim()}`
+            : `Claude CLI exited unexpectedly with code ${code}`;
+          endStreamWithError(message);
+        }
+      });
 
       // Inactivity timeout: kill subprocess if no stdout for INACTIVITY_TIMEOUT_MS
       function resetInactivityTimer() {
@@ -411,35 +448,9 @@ export function streamViaCli(
         options.signal.addEventListener("abort", abortHandler, { once: true });
       }
 
-      // Track tool_use blocks for break-early decision at message_stop
-      let sawBuiltInOrCustomTool = false;
-
-      // Set up readline for line-by-line NDJSON parsing
-      const rl = createInterface({
-        input: proc.stdout!,
-        crlfDelay: Infinity,
-        terminal: false,
-      });
-
-      // Handle process error -- use endStreamWithError for guard
-      proc.on("error", (err: Error) => {
-        if (broken) return; // Break-early killed the process intentionally
-        const stderr = getStderr();
-        endStreamWithError(stderr || err.message);
-      });
-
-      // Handle subprocess close -- surface crashes with stderr and exit code
-      proc.on("close", (code: number | null, _signal: string | null) => {
-        clearTimeout(inactivityTimer);
-        if (broken) return; // Break-early kill, expected
-        if (code !== 0 && code !== null) {
-          const stderr = getStderr();
-          const message = stderr
-            ? `Claude CLI exited with code ${code}: ${stderr.trim()}`
-            : `Claude CLI exited unexpectedly with code ${code}`;
-          endStreamWithError(message);
-        }
-      });
+      // Write user message only after failure handlers and stdout reader are
+      // attached; fake/real CLIs can fail immediately.
+      writeUserMessage(proc, prompt);
 
       // Start inactivity timer after writing user message
       resetInactivityTimer();
@@ -495,6 +506,7 @@ export function streamViaCli(
         } else if (msg.type === "control_request") {
           handleControlRequest(msg, proc!.stdin!);
         } else if (msg.type === "result") {
+          resultReceived = true;
           if (msg.subtype === "error") {
             endStreamWithError(msg.error ?? "Unknown error from Claude CLI");
           }
@@ -509,6 +521,16 @@ export function streamViaCli(
       await new Promise<void>((resolve) => {
         rl.on("close", resolve);
       });
+
+      // Some fast CLI failures close stdout before Node emits the child
+      // process `close` event. Give that event a tiny chance to report a
+      // non-zero exit before treating stdout EOF as a successful truncation.
+      if (!streamEnded && !resultReceived && !processClosed) {
+        await Promise.race([
+          processClosePromise,
+          new Promise((resolve) => setTimeout(resolve, 25)),
+        ]);
+      }
 
       // Push done event after readline closes (async). Pushing synchronously
       // inside handleMessageStop prevents pi from executing tools.
