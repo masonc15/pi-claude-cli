@@ -202,6 +202,14 @@ run_pi_case "result-error" "error" "fail visibly"
 assert_status_nonzero
 assert_contains "$RUN_ERR" "fake rate limit"
 
+run_pi_case "rate-warning" "rate-warning" "warn about rate usage"
+assert_status 0
+assert_contains "$RUN_OUT" "fake rate warning response"
+assert_contains "$RUN_OUT" "[pi-claude-cli notice]"
+assert_contains "$RUN_OUT" "Claude Code 5-hour included usage is at 100%"
+assert_contains "$RUN_OUT" "extra usage"
+assert_trace_contains "stdout.ndjson" "rate_limit_event"
+
 run_pi_case "no-result" "no-result" "fail when claude stream ends early"
 assert_status_nonzero
 assert_contains "$RUN_ERR" "Claude CLI exited without a result event"

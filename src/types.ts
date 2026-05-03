@@ -22,6 +22,19 @@ export interface ClaudeSystemMessage {
   tools?: unknown[];
 }
 
+export interface ClaudeRateLimitEventMessage {
+  type: "rate_limit_event";
+  rate_limit_info?: {
+    status?: string;
+    resetsAt?: number;
+    rateLimitType?: string;
+    utilization?: number;
+    isUsingOverage?: boolean;
+    surpassedThreshold?: number;
+  };
+  session_id?: string;
+}
+
 export interface ClaudeControlRequest {
   type: "control_request";
   request_id: string;
@@ -36,6 +49,7 @@ export type NdjsonMessage =
   | ClaudeStreamEventMessage
   | ClaudeResultMessage
   | ClaudeSystemMessage
+  | ClaudeRateLimitEventMessage
   | ClaudeControlRequest;
 
 // Claude API event types (inside stream_event wrapper)

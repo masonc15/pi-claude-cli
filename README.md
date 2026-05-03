@@ -36,6 +36,7 @@ Then select a Claude model via `/model` in the interactive UI. All Claude models
 - Isolates subprocesses from user-level Claude Code plugins, hooks, and external MCPs by default
 - Session resume via `--resume` eliminates history replay on follow-up turns
 - Truthful, model-family-aware mapping from pi's thinking levels to Claude CLI `--effort`
+- Visible `[pi-claude-cli notice]` messages when Claude Code reports near/exhausted included usage
 - Cross-platform subprocess management (Windows, macOS, Linux)
 - Inactivity timeout and process registry for cleanup
 
@@ -48,7 +49,7 @@ Each trace contains:
 - `meta.json`: model, cwd, session IDs, resolved effort, exact `claude` argv, and redacted auth-related environment facts
 - `system-prompt.txt`: the full prompt pi-claude-cli passes through `--append-system-prompt`
 - `stdin.ndjson`: every line pi-claude-cli writes to Claude Code, including the user message and permission/control responses
-- `stdout.ndjson`: every raw stream-json line emitted by Claude Code, including system events, tool calls, tool results, and result events
+- `stdout.ndjson`: every raw stream-json line emitted by Claude Code, including system events, tool calls, tool results, rate-limit events, and result events
 - `stderr.log`: raw Claude Code stderr
 - `lifecycle.jsonl`: concise timing/index events for spawn, stdin writes, stdout lines, control requests, break-early kills, exits, aborts, and timeouts
 - `claude-debug.log`: Claude Code's own debug log, enabled by passing `--debug-file` only when trace mode is on

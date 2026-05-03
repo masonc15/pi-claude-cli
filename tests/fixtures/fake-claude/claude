@@ -82,6 +82,21 @@ function emitResultError() {
   line({ type: "result", subtype: "error", error: "fake rate limit" });
 }
 
+function emitRateLimitWarning() {
+  line({
+    type: "rate_limit_event",
+    rate_limit_info: {
+      status: "allowed_warning",
+      resetsAt: 1777848000,
+      rateLimitType: "five_hour",
+      utilization: 1,
+      isUsingOverage: false,
+      surpassedThreshold: 0.9,
+    },
+  });
+  emitText("fake rate warning response");
+}
+
 function emitNoResult() {
   line({
     type: "system",
@@ -176,6 +191,9 @@ switch (mode) {
     break;
   case "error":
     emitResultError();
+    break;
+  case "rate-warning":
+    emitRateLimitWarning();
     break;
   case "no-result":
     emitNoResult();

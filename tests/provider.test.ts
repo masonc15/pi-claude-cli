@@ -297,6 +297,99 @@ describe("streamViaCli", () => {
     expect(eventTypes).toContain("done");
   });
 
+  it("adds a visible notice when Claude reports exhausted included usage but succeeds", async () => {
+    const model = mockModels[0] as any;
+    const context = {
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    streamViaCli(model, context);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const proc = (spawn as any).mock.results[0].value;
+    const lines = [
+      JSON.stringify({
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          resetsAt: 1777848000,
+          rateLimitType: "five_hour",
+          utilization: 1,
+          isUsingOverage: false,
+          surpassedThreshold: 0.9,
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "message_start",
+          message: { usage: { input_tokens: 10, output_tokens: 0 } },
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "Hello world" },
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: { type: "content_block_stop", index: 0 },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { output_tokens: 5 },
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: { type: "message_stop" },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        result: "Hello world",
+      }),
+    ];
+
+    for (const line of lines) {
+      proc.stdout.write(line + "\n");
+    }
+    proc.stdout.end();
+    await vi.advanceTimersByTimeAsync(100);
+
+    const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+    const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+    expect(doneEvent).toBeDefined();
+    expect(doneEvent.message.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining(
+            "Claude Code 5-hour included usage is at 100%",
+          ),
+        }),
+      ]),
+    );
+    const notice = doneEvent.message.content.at(-1).text;
+    expect(notice).toContain("[pi-claude-cli notice]");
+    expect(notice).toContain("extra usage");
+    expect(notice).toContain("2026-05-03T22:40:00.000Z");
+  });
+
   it("handles result error by pushing error event", async () => {
     const model = mockModels[0] as any;
     const context = {

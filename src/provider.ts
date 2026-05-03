@@ -43,6 +43,7 @@ import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
 import { extractAllowedClaudeTools } from "./tool-availability.js";
 import { createClaudeTrace } from "./claude-trace.js";
+import type { ClaudeRateLimitEventMessage } from "./types.js";
 /**
  * Inactivity timeout: kill the subprocess if no stdout for this long.
  *
@@ -66,6 +67,80 @@ const PI_CLAUDE_CLI_PROVIDER_ID = "pi-claude-cli";
  * this synthetic block) and to make the notice greppable in pi's logs.
  */
 const TRUNCATION_NOTICE_MARKER = "[pi-claude-cli notice]";
+
+type ClaudeRateLimitInfo = NonNullable<
+  ClaudeRateLimitEventMessage["rate_limit_info"]
+>;
+
+function formatRateLimitWindow(rateLimitType?: string): string {
+  switch (rateLimitType) {
+    case "five_hour":
+      return "5-hour";
+    case "seven_day":
+      return "7-day";
+    default:
+      return rateLimitType ? rateLimitType.replace(/_/g, " ") : "rate-limit";
+  }
+}
+
+function formatRateLimitReset(resetsAt?: number): string | undefined {
+  if (
+    typeof resetsAt !== "number" ||
+    !Number.isFinite(resetsAt) ||
+    resetsAt <= 0
+  ) {
+    return undefined;
+  }
+  return new Date(resetsAt * 1000).toISOString();
+}
+
+function formatRateLimitNotice(
+  info: ClaudeRateLimitInfo | undefined,
+): string | undefined {
+  if (!info) return undefined;
+
+  const status =
+    typeof info.status === "string" ? info.status.toLowerCase() : "";
+  const utilization =
+    typeof info.utilization === "number" && Number.isFinite(info.utilization)
+      ? info.utilization
+      : undefined;
+  const shouldNotice =
+    info.isUsingOverage === true ||
+    status.includes("warning") ||
+    (utilization !== undefined && utilization >= 0.9);
+
+  if (!shouldNotice) return undefined;
+
+  const percent =
+    utilization !== undefined ? Math.round(utilization * 100) : undefined;
+  const windowLabel = formatRateLimitWindow(info.rateLimitType);
+  const reset = formatRateLimitReset(info.resetsAt);
+  const usageText =
+    percent !== undefined ? ` is at ${percent}%` : " is near its limit";
+  const consequence =
+    info.isUsingOverage === true ||
+    (utilization !== undefined && utilization >= 1)
+      ? "This request was allowed; if extra usage is enabled, continued requests may bill as extra usage until the reset."
+      : "This request was allowed, but continued requests may hit the included limit soon.";
+
+  return (
+    `${TRUNCATION_NOTICE_MARKER} Claude Code ${windowLabel} included usage` +
+    `${usageText}${reset ? `; reset: ${reset}` : ""}. ${consequence}`
+  );
+}
+
+function appendRateLimitNotice<T extends { content?: unknown[] }>(
+  message: T,
+  notice: string | undefined,
+): T {
+  if (!notice) return message;
+  const content = Array.isArray(message.content) ? message.content : [];
+  return {
+    ...message,
+    content: [...content, { type: "text", text: notice }],
+  };
+}
 
 /**
  * Detect tool calls whose `arguments` is a string instead of an object.
@@ -249,6 +324,7 @@ export function streamViaCli(
     let broken = false;
     let resultReceived = false;
     let processClosed = false;
+    let rateLimitNotice: string | undefined;
     let resolveProcessClose: () => void = () => {};
     const processClosePromise = new Promise<void>((resolve) => {
       resolveProcessClose = resolve;
@@ -301,9 +377,10 @@ export function streamViaCli(
         content: baseContent,
         stopReason: reason,
       });
+      const message = appendRateLimitNotice(repaired.message, rateLimitNotice);
 
       return {
-        ...repaired.message,
+        ...message,
         stopReason: reason,
         errorMessage: errMsg,
       };
@@ -563,6 +640,15 @@ export function streamViaCli(
             toolName: (msg as any).request?.tool_name,
             allowed,
           });
+        } else if (msg.type === "rate_limit_event") {
+          rateLimitNotice =
+            formatRateLimitNotice(msg.rate_limit_info) ?? rateLimitNotice;
+          if (rateLimitNotice) {
+            trace?.record("rate_limit_notice", {
+              notice: rateLimitNotice,
+              info: msg.rate_limit_info,
+            });
+          }
         } else if (msg.type === "result") {
           resultReceived = true;
           trace?.record("result", {
@@ -629,12 +715,16 @@ export function streamViaCli(
           ...output,
           stopReason: output.stopReason,
         });
+        const message = appendRateLimitNotice(
+          repaired.message,
+          rateLimitNotice,
+        );
 
         // If stopReason is toolUse but there are no pi-known tool calls in
         // content, it means only user MCP tools were called (filtered by
         // event bridge) OR every tool_use was truncated and stripped above.
         // Override to "stop" so pi doesn't try to execute non-existent tools.
-        const piToolCalls = (repaired.message.content || []).filter(
+        const piToolCalls = (message.content || []).filter(
           (c: any) => c.type === "toolCall",
         );
         const effectiveReason =
@@ -652,7 +742,7 @@ export function streamViaCli(
               : effectiveReason === "length"
                 ? "length"
                 : "stop",
-          message: { ...repaired.message, stopReason: effectiveReason },
+          message: { ...message, stopReason: effectiveReason },
         });
         stream.end();
       }
