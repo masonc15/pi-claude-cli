@@ -180,6 +180,31 @@ describe("buildPrompt", () => {
     expect(result).toBe("TOOL RESULT (historical Bash):\nline 1\nline 2");
   });
 
+  it("adds an exact Pi skill location reminder when the user names a listed skill", () => {
+    const context = {
+      systemPrompt: [
+        "<available_skills>",
+        "  <skill>",
+        "    <name>pi-claude-skill-e2e</name>",
+        "    <location>/tmp/pi-skill-e2e/SKILL.md</location>",
+        "  </skill>",
+        "</available_skills>",
+      ].join("\n"),
+      messages: [
+        {
+          role: "user",
+          content: "Use the pi-claude-skill-e2e skill now.",
+        },
+      ],
+    } as unknown as any;
+
+    const result = buildPrompt(context) as string;
+
+    expect(result).toContain("PI SKILL LOCATION REMINDER");
+    expect(result).toContain("/tmp/pi-skill-e2e/SKILL.md");
+    expect(result).toContain("Do not read standard Claude Code skill paths");
+  });
+
   describe("tool name and argument reverse mapping", () => {
     it("maps pi tool name to Claude name in toolCall serialization", () => {
       const context = {
@@ -933,6 +958,7 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("Pi skills");
     expect(result).toContain("Read tool");
     expect(result).toContain("Do not search");
+    expect(result).toContain("Do not read standard Claude Code skill paths");
   });
 });
 
@@ -985,6 +1011,48 @@ describe("buildResumePrompt", () => {
     expect(result).toContain("TOOL RESULT (historical Read):");
     expect(result).toContain("file contents here");
     expect(result).toContain("Now explain it");
+  });
+
+  it("adds an exact Pi skill location reminder on resumed skill turns", () => {
+    const context = {
+      systemPrompt: [
+        "<available_skills>",
+        "  <skill>",
+        "    <name>pi-claude-skill-e2e</name>",
+        "    <location>/tmp/pi-skill-e2e/SKILL.md</location>",
+        "  </skill>",
+        "</available_skills>",
+      ].join("\n"),
+      messages: [
+        {
+          role: "user",
+          content: "Use the pi-claude-skill-e2e skill now.",
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              name: "read",
+              arguments: {
+                path: "/Users/colin/.claude/skills/pi-claude-skill-e2e/SKILL.md",
+              },
+            },
+          ],
+        },
+        {
+          role: "toolResult",
+          toolName: "read",
+          content: "ENOENT: no such file or directory",
+        },
+      ],
+    } as unknown as any;
+
+    const result = buildResumePrompt(context) as string;
+
+    expect(result).toContain("PI SKILL LOCATION REMINDER");
+    expect(result).toContain("/tmp/pi-skill-e2e/SKILL.md");
+    expect(result).toContain("TOOL RESULT (historical Read):");
   });
 
   it("includes multiple tool results preceding the final user message", () => {

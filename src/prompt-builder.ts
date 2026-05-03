@@ -47,7 +47,13 @@ let placeholderImageCount = 0;
 const PI_SKILL_USAGE_GUIDANCE =
   "IMPORTANT: The <available_skills> block lists Pi skills, not necessarily Claude Code native skills. " +
   "When a listed Pi skill is relevant, use the exact <location> path shown for that skill directly with the Read tool to load its SKILL.md. " +
+  "Do not read standard Claude Code skill paths such as ~/.claude/skills, .claude/skills, or repo skills directories for listed Pi skills. " +
   "Do not search for listed Pi skills with Glob, Grep, Bash, or the Skill tool unless the user explicitly asks you to discover skills.";
+
+interface PiSkillRef {
+  name: string;
+  location: string;
+}
 
 /**
  * Translate a pi-ai image block to Anthropic API format.
@@ -157,6 +163,7 @@ function buildCustomToolResultPrompt(messages: any[]): string | null {
  */
 export function buildResumePrompt(context: {
   messages: any[];
+  systemPrompt?: string;
 }): string | AnthropicContentBlock[] {
   const messages = context.messages;
   if (messages.length === 0) return "";
@@ -186,6 +193,14 @@ export function buildResumePrompt(context: {
 
   // If there are only tool results + one user message, build a combined prompt
   const parts: string[] = [];
+  const skillReminder = buildPiSkillLocationReminder(
+    context.systemPrompt,
+    userContentSearchText(messages[finalUserIndex].content),
+  );
+  if (skillReminder) {
+    parts.push(skillReminder);
+  }
+
   for (const msg of newMessages) {
     if (msg.role === "toolResult") {
       if (msg.toolName && isCustomToolName(msg.toolName)) {
@@ -218,6 +233,7 @@ export function buildResumePrompt(context: {
 
 export function buildPrompt(context: {
   messages: any[];
+  systemPrompt?: string;
 }): string | AnthropicContentBlock[] {
   // Reset placeholder counter for each call
   placeholderImageCount = 0;
@@ -237,6 +253,13 @@ export function buildPrompt(context: {
 
   // Determine if any message has images worth passing through
   const finalUserIndex = findFinalUserMessageIndex(context.messages);
+  const skillReminder =
+    finalUserIndex >= 0
+      ? buildPiSkillLocationReminder(
+          context.systemPrompt,
+          userContentSearchText(context.messages[finalUserIndex].content),
+        )
+      : undefined;
   const finalUserHasImages =
     finalUserIndex >= 0 &&
     contentHasImages(context.messages[finalUserIndex].content);
@@ -247,6 +270,9 @@ export function buildPrompt(context: {
   if (finalUserHasImages || anyToolResultHasImages) {
     // Build history as text (all messages except the final user message)
     const historyParts: string[] = [];
+    if (skillReminder) {
+      historyParts.push(skillReminder);
+    }
     const toolResultImageBlocks: AnthropicContentBlock[] = [];
     for (let i = 0; i < context.messages.length; i++) {
       if (i === finalUserIndex) continue; // Skip final user message -- handled separately
@@ -311,6 +337,9 @@ export function buildPrompt(context: {
 
   // No images in final user message: standard text-only path
   const parts: string[] = [];
+  if (skillReminder) {
+    parts.push(skillReminder);
+  }
 
   for (const message of context.messages) {
     if (message.role === "user") {
@@ -400,6 +429,53 @@ function hasPiSkillList(systemPrompt: string): boolean {
     systemPrompt.includes("<available_skills>") &&
     systemPrompt.includes("<location>")
   );
+}
+
+function buildPiSkillLocationReminder(
+  systemPrompt: string | undefined,
+  userText: string,
+): string | undefined {
+  if (!systemPrompt || !userText) return undefined;
+
+  const matchedSkills = extractPiSkillRefs(systemPrompt).filter((skill) =>
+    userText.includes(skill.name),
+  );
+  if (matchedSkills.length === 0) return undefined;
+
+  const lines = matchedSkills.map(
+    (skill) =>
+      `- For Pi skill "${skill.name}", read exactly this SKILL.md path with the Read tool before following it: ${skill.location}`,
+  );
+  return [
+    "PI SKILL LOCATION REMINDER:",
+    ...lines,
+    "Do not read standard Claude Code skill paths for listed Pi skills.",
+  ].join("\n");
+}
+
+function extractPiSkillRefs(systemPrompt: string): PiSkillRef[] {
+  const refs: PiSkillRef[] = [];
+  for (const match of systemPrompt.matchAll(/<skill>\s*([\s\S]*?)<\/skill>/g)) {
+    const block = match[1] ?? "";
+    const name = /<name>\s*([^<]+?)\s*<\/name>/.exec(block)?.[1]?.trim();
+    const location = /<location>\s*([^<]+?)\s*<\/location>/
+      .exec(block)?.[1]
+      ?.trim();
+    if (name && location) {
+      refs.push({ name, location });
+    }
+  }
+  return refs;
+}
+
+function userContentSearchText(content: string | any[]): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("\n");
 }
 
 /**
