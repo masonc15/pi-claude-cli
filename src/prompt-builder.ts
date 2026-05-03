@@ -425,9 +425,18 @@ export function buildSystemPrompt(
 }
 
 function hasPiSkillList(systemPrompt: string): boolean {
-  return (
-    systemPrompt.includes("<available_skills>") &&
-    systemPrompt.includes("<location>")
+  return extractPiSkillRefs(systemPrompt).length > 0;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function userMentionsSkillName(userText: string, skillName: string): boolean {
+  const escaped = escapeRegExp(skillName);
+  const boundary = "[^\\p{L}\\p{N}_-]";
+  return new RegExp(`(^|${boundary})${escaped}(?=$|${boundary})`, "u").test(
+    userText,
   );
 }
 
@@ -438,7 +447,7 @@ function buildPiSkillLocationReminder(
   if (!systemPrompt || !userText) return undefined;
 
   const matchedSkills = extractPiSkillRefs(systemPrompt).filter((skill) =>
-    userText.includes(skill.name),
+    userMentionsSkillName(userText, skill.name),
   );
   if (matchedSkills.length === 0) return undefined;
 
@@ -461,6 +470,9 @@ function extractPiSkillRefs(systemPrompt: string): PiSkillRef[] {
     const location = /<location>\s*([^<]+?)\s*<\/location>/
       .exec(block)?.[1]
       ?.trim();
+    // Malformed <skill> blocks are ignored intentionally. Without both a name
+    // and an exact SKILL.md location, adding skill-loading guidance would be
+    // more misleading than helpful.
     if (name && location) {
       refs.push({ name, location });
     }

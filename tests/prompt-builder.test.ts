@@ -205,6 +205,44 @@ describe("buildPrompt", () => {
     expect(result).toContain("Do not read standard Claude Code skill paths");
   });
 
+  it("does not add a Pi skill reminder for substring-only skill name matches", () => {
+    const context = {
+      systemPrompt: [
+        "<available_skills>",
+        "  <skill>",
+        "    <name>test</name>",
+        "    <location>/tmp/test/SKILL.md</location>",
+        "  </skill>",
+        "</available_skills>",
+      ].join("\n"),
+      messages: [{ role: "user", content: "Tell me the latest status." }],
+    } as unknown as any;
+
+    const result = buildPrompt(context) as string;
+
+    expect(result).not.toContain("PI SKILL LOCATION REMINDER");
+    expect(result).not.toContain("/tmp/test/SKILL.md");
+  });
+
+  it("matches skill names with punctuation boundaries", () => {
+    const context = {
+      systemPrompt: [
+        "<available_skills>",
+        "  <skill>",
+        "    <name>pi-claude-skill-e2e</name>",
+        "    <location>/tmp/pi-skill-e2e/SKILL.md</location>",
+        "  </skill>",
+        "</available_skills>",
+      ].join("\n"),
+      messages: [{ role: "user", content: "/skill:pi-claude-skill-e2e run" }],
+    } as unknown as any;
+
+    const result = buildPrompt(context) as string;
+
+    expect(result).toContain("PI SKILL LOCATION REMINDER");
+    expect(result).toContain("/tmp/pi-skill-e2e/SKILL.md");
+  });
+
   describe("tool name and argument reverse mapping", () => {
     it("maps pi tool name to Claude name in toolCall serialization", () => {
       const context = {
@@ -959,6 +997,30 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("Read tool");
     expect(result).toContain("Do not search");
     expect(result).toContain("Do not read standard Claude Code skill paths");
+  });
+
+  it("does not add Pi skill loading guidance for malformed available_skills blocks", async () => {
+    vi.doMock("node:fs", () => ({
+      existsSync: () => false,
+      readFileSync: () => "",
+    }));
+
+    const { buildSystemPrompt: bsp } = await import("../src/prompt-builder");
+    const context = {
+      systemPrompt: [
+        "<available_skills>",
+        "  <skill>",
+        "    <name>broken</name>",
+        "  </skill>",
+        "</available_skills>",
+      ].join("\n"),
+      messages: [],
+    } as unknown as any;
+    const result = bsp(context, "/some/project");
+    expect(result).not.toContain("Pi skills");
+    expect(result).not.toContain(
+      "Do not read standard Claude Code skill paths",
+    );
   });
 });
 
