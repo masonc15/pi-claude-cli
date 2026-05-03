@@ -57,6 +57,7 @@ const mockModels = [
     api: "anthropic",
     provider: "anthropic",
     reasoning: true,
+    thinkingLevelMap: { xhigh: "xhigh" },
     input: "text",
     cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
     contextWindow: 200000,
@@ -129,6 +130,21 @@ describe("provider registration (default export)", () => {
     expect(firstModel.contextWindow).toBe(200000);
     expect(firstModel.maxTokens).toBe(8192);
     expect(firstModel.cost).toBeDefined();
+  });
+
+  it("preserves thinkingLevelMap from Anthropic models", async () => {
+    const registerProvider = vi.fn();
+    const mockPi = { registerProvider, on: vi.fn() } as any;
+
+    const mod = await import("../index");
+    mod.default(mockPi);
+
+    const config = registerProvider.mock.calls[0][1];
+    const opus47 = config.models.find(
+      (model: any) => model.id === "claude-opus-4-7",
+    );
+
+    expect(opus47.thinkingLevelMap).toEqual({ xhigh: "xhigh" });
   });
 });
 

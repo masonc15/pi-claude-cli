@@ -79,6 +79,7 @@ export default function (pi: ExtensionAPI) {
       cost: model.cost,
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
+      thinkingLevelMap: model.thinkingLevelMap,
     }));
 
     // Ensure all registered tools are active so pi can execute them.
