@@ -17,8 +17,10 @@
 import { createInterface } from "node:readline";
 import {
   AssistantMessageEventStream,
+  type AssistantMessage,
   type Model,
   type SimpleStreamOptions,
+  type StopReason,
 } from "@mariozechner/pi-ai";
 import {
   buildPrompt,
@@ -208,6 +210,8 @@ type StreamViaCLiOptions = SimpleStreamOptions & {
   mcpConfigPath?: string;
 };
 
+type ErrorStopReason = Extract<StopReason, "error" | "aborted">;
+
 /**
  * Stream a response from Claude CLI as an AssistantMessageEventStream.
  *
@@ -237,9 +241,88 @@ export function streamViaCli(
   (async () => {
     let proc: ReturnType<typeof spawnClaude> | undefined;
     let abortHandler: (() => void) | undefined;
+    let bridge: ReturnType<typeof createEventBridge> | undefined;
+    let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+    let streamEnded = false;
+    let broken = false;
+
+    function emptyUsage(): AssistantMessage["usage"] {
+      return {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 0,
+        },
+      };
+    }
+
+    function buildErrorMessage(
+      errMsg: string,
+      reason: ErrorStopReason,
+    ): AssistantMessage {
+      if (!bridge) {
+        return {
+          role: "assistant",
+          content: [{ type: "text", text: `Error: ${errMsg}` }],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: emptyUsage(),
+          stopReason: reason,
+          errorMessage: errMsg,
+          timestamp: Date.now(),
+        };
+      }
+
+      // Close out any in-flight tool_use blocks so partial args are not
+      // dropped when the stream ends without a content_block_stop.
+      bridge.finalize();
+      const output = bridge.getOutput();
+      const baseContent = output.content?.length
+        ? output.content
+        : [{ type: "text" as const, text: `Error: ${errMsg}` }];
+      const repaired = repairTruncatedToolCalls({
+        ...output,
+        content: baseContent,
+        stopReason: reason,
+      });
+
+      return {
+        ...repaired.message,
+        stopReason: reason,
+        errorMessage: errMsg,
+      };
+    }
+
+    function endStreamWithError(
+      errMsg: string,
+      reason: ErrorStopReason = "error",
+    ) {
+      if (streamEnded || broken) return;
+      streamEnded = true;
+      stream.push({
+        type: "error",
+        reason,
+        error: buildErrorMessage(errMsg, reason),
+      });
+      stream.end();
+    }
 
     try {
       const cwd = options?.cwd ?? process.cwd();
+      const inactivityTimeoutMs =
+        typeof options?.timeoutMs === "number" &&
+        Number.isFinite(options.timeoutMs) &&
+        options.timeoutMs > 0
+          ? options.timeoutMs
+          : INACTIVITY_TIMEOUT_MS;
 
       // Resume only if pi provides a session ID AND a prior assistant turn in
       // this conversation went through pi-claude-cli. Pi passes sessionId on
@@ -295,56 +378,20 @@ export function streamViaCli(
       // Write user message to subprocess stdin
       writeUserMessage(proc, prompt);
 
-      // Create event bridge (before endStreamWithError so bridge is in scope)
-      const bridge = createEventBridge(stream, model);
-
-      // Guard against double stream.end() and double error events.
-      // First error path wins; subsequent ones are no-ops.
-      let streamEnded = false;
-
-      /**
-       * End the stream with an error, using a "done" event instead of "error".
-       *
-       * Why "done" not "error": AssistantMessageEventStream.extractResult()
-       * returns event.error (a string) for error events, but agent-loop.js
-       * then calls message.content.filter() on the result, crashing because
-       * a string has no .content property. By pushing "done" with a valid
-       * AssistantMessage (content:[]), pi gets a well-formed object.
-       */
-      function endStreamWithError(errMsg: string) {
-        if (streamEnded || broken) return;
-        streamEnded = true;
-        // Close out any in-flight tool_use blocks so partial args are not
-        // dropped when the stream ends without a content_block_stop.
-        bridge.finalize();
-        const output = bridge.getOutput();
-        const baseContent = output.content?.length
-          ? output.content
-          : [{ type: "text" as const, text: `Error: ${errMsg}` }];
-        const repaired = repairTruncatedToolCalls({
-          ...output,
-          content: baseContent,
-          stopReason: "stop" as const,
-        });
-        stream.push({
-          type: "done",
-          reason: "stop",
-          message: repaired.message,
-        } as any);
-        stream.end();
-      }
+      // Create event bridge before installing lifecycle handlers so every
+      // failure path can return a normal assistant-shaped error payload.
+      const eventBridge = createEventBridge(stream, model);
+      bridge = eventBridge;
 
       // Inactivity timeout: kill subprocess if no stdout for INACTIVITY_TIMEOUT_MS
-      let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
-
       function resetInactivityTimer() {
         if (inactivityTimer !== undefined) clearTimeout(inactivityTimer);
         inactivityTimer = setTimeout(() => {
           forceKillProcess(proc!);
           endStreamWithError(
-            `Claude CLI subprocess timed out: no output for ${INACTIVITY_TIMEOUT_MS / 1000} seconds`,
+            `Claude CLI subprocess timed out: no output for ${inactivityTimeoutMs / 1000} seconds`,
           );
-        }, INACTIVITY_TIMEOUT_MS);
+        }, inactivityTimeoutMs);
       }
 
       // Set up abort signal handler -- uses SIGKILL for immediate force-kill
@@ -353,6 +400,8 @@ export function streamViaCli(
           if (proc) {
             forceKillProcess(proc);
           }
+          clearTimeout(inactivityTimer);
+          endStreamWithError("Claude CLI subprocess aborted", "aborted");
         };
 
         if (options.signal.aborted) {
@@ -364,8 +413,6 @@ export function streamViaCli(
 
       // Track tool_use blocks for break-early decision at message_stop
       let sawBuiltInOrCustomTool = false;
-      // Guard against buffered readline lines firing after rl.close()
-      let broken = false;
 
       // Set up readline for line-by-line NDJSON parsing
       const rl = createInterface({
@@ -414,7 +461,7 @@ export function streamViaCli(
           // Sub-agent events (parent_tool_use_id !== null) are internal to the CLI.
           const isTopLevel = !(msg as any).parent_tool_use_id;
           if (isTopLevel) {
-            bridge.handleEvent(msg.event);
+            eventBridge.handleEvent(msg.event);
           }
 
           // Track tool_use blocks for break-early decision (top-level only)
@@ -469,8 +516,8 @@ export function streamViaCli(
       if (!streamEnded) {
         // Close out any in-flight tool_use blocks so partial args are not
         // dropped when the stream ends without a content_block_stop.
-        bridge.finalize();
-        const output = bridge.getOutput();
+        eventBridge.finalize();
+        const output = eventBridge.getOutput();
 
         // Convert any truncated tool_use blocks (string-valued args from
         // finalize fallback) into a text notice the model can see and act
@@ -508,12 +555,7 @@ export function streamViaCli(
         stream.end();
       }
     } catch (err: any) {
-      stream.push({
-        type: "error",
-        reason: "error",
-        error: err.message ?? "Unexpected error in streamViaCli",
-      } as any);
-      stream.end();
+      endStreamWithError(err.message ?? "Unexpected error in streamViaCli");
     } finally {
       // Clean up abort listener
       if (options?.signal && abortHandler) {
