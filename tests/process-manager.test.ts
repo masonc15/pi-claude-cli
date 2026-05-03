@@ -388,6 +388,13 @@ describe("CLI flags", () => {
     expect(args[idx + 1]).toBe("stdio");
   });
 
+  it("disables Claude Code native slash commands and skills", () => {
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--disable-slash-commands");
+  });
+
   it("isolates Claude Code user settings and external MCPs by default", () => {
     spawnClaude("claude-sonnet-4-5-20250929");
     const args = (spawn as any).mock.calls[0][1] as string[];
@@ -638,6 +645,32 @@ describe("resume session flag", () => {
 
     expect(args).toContain("--resume");
     expect(args).toContain("--mcp-config");
+  });
+
+  it("includes explicit allowed tools when resuming without a system prompt", () => {
+    spawnClaude("claude-sonnet-4-5-20250929", undefined, {
+      resumeSessionId: "session-abc",
+      allowedTools: ["Read"],
+    });
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--resume");
+    expect(args).toContain("--tools");
+    const idx = args.indexOf("--tools");
+    expect(args[idx + 1]).toBe("Read");
+  });
+
+  it("passes empty explicit allowed tools when resuming with no Pi built-ins", () => {
+    spawnClaude("claude-sonnet-4-5-20250929", undefined, {
+      resumeSessionId: "session-abc",
+      allowedTools: [],
+    });
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--resume");
+    expect(args).toContain("--tools");
+    const idx = args.indexOf("--tools");
+    expect(args[idx + 1]).toBe("");
   });
 });
 

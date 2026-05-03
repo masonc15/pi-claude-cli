@@ -2715,5 +2715,67 @@ describe("streamViaCli", () => {
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
     });
+
+    it("keeps Pi built-in tool restrictions when resuming", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "Read a file" },
+          {
+            role: "assistant",
+            content: "I can read that.",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
+          { role: "user", content: "Continue" },
+        ],
+        systemPrompt: "Available tools:\n- read: Read file contents\n",
+      };
+
+      streamViaCli(model, context, { sessionId: "sess-resume" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).toContain("--resume");
+      expect(args).not.toContain("--append-system-prompt");
+      expect(args).toContain("--tools");
+      const idx = args.indexOf("--tools");
+      expect(args[idx + 1]).toBe("Read");
+
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("keeps empty Pi built-in tool restrictions when resuming with only custom tools", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "Deploy this" },
+          {
+            role: "assistant",
+            content: "I can deploy that.",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
+          { role: "user", content: "Continue" },
+        ],
+        systemPrompt: "Available tools:\n- deploy: Custom project tool\n",
+      };
+
+      streamViaCli(model, context, { sessionId: "sess-resume" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).toContain("--resume");
+      expect(args).not.toContain("--append-system-prompt");
+      expect(args).toContain("--tools");
+      const idx = args.indexOf("--tools");
+      expect(args[idx + 1]).toBe("");
+
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
   });
 });

@@ -9,6 +9,7 @@ RUN_OUT=""
 RUN_ERR=""
 RUN_STATUS=0
 RUN_TRACE_DIR=""
+RUN_ARG_LOG=""
 
 cleanup() {
   rm -rf "$TMP_ROOT"
@@ -69,6 +70,61 @@ assert_trace_contains() {
   fi
 }
 
+assert_arg_log_all_spawns_have_tool() {
+  local expected="$1"
+  if ! node - "$RUN_ARG_LOG" "$expected" <<'NODE'
+const fs = require("node:fs");
+
+const [path, expected] = process.argv.slice(2);
+const text = fs.readFileSync(path, "utf-8").trim();
+const rows = (text ? text.split(/\n+/).map((line) => JSON.parse(line)) : [])
+  .filter((row) => Array.isArray(row.args) && row.args.includes("-p"));
+
+if (rows.length === 0) {
+  console.error("arg log has no claude -p spawns");
+  process.exit(1);
+}
+
+for (const [index, row] of rows.entries()) {
+  const args = Array.isArray(row.args) ? row.args : [];
+  const toolsIndex = args.indexOf("--tools");
+  if (toolsIndex < 0) {
+    console.error(`spawn ${index} is missing --tools: ${JSON.stringify(args)}`);
+    process.exit(1);
+  }
+  if (args[toolsIndex + 1] !== expected) {
+    console.error(
+      `spawn ${index} expected --tools ${expected}, got ${JSON.stringify(args[toolsIndex + 1])}: ${JSON.stringify(args)}`,
+    );
+    process.exit(1);
+  }
+}
+NODE
+  then
+    fail "expected every fake claude spawn to include --tools $expected"
+  fi
+}
+
+assert_arg_log_any_spawn_has_flag() {
+  local flag="$1"
+  if ! node - "$RUN_ARG_LOG" "$flag" <<'NODE'
+const fs = require("node:fs");
+
+const [path, flag] = process.argv.slice(2);
+const text = fs.readFileSync(path, "utf-8").trim();
+const rows = (text ? text.split(/\n+/).map((line) => JSON.parse(line)) : [])
+  .filter((row) => Array.isArray(row.args) && row.args.includes("-p"));
+
+if (!rows.some((row) => Array.isArray(row.args) && row.args.includes(flag))) {
+  console.error(`no spawn included ${flag}`);
+  process.exit(1);
+}
+NODE
+  then
+    fail "expected at least one fake claude spawn to include $flag"
+  fi
+}
+
 run_pi_case() {
   local name="$1"
   local mode="$2"
@@ -80,6 +136,7 @@ run_pi_case() {
   RUN_TRACE_DIR="$case_dir/claude-trace"
   local state_file="$case_dir/fake-state.txt"
   local arg_log="$case_dir/fake-args.jsonl"
+  RUN_ARG_LOG="$arg_log"
 
   set +e
   (
@@ -94,7 +151,7 @@ run_pi_case() {
       PI_CLAUDE_CLI_TRACE_DIR="$RUN_TRACE_DIR" \
       pi \
         --offline \
-        --no-session \
+        --session-dir "$case_dir/sessions" \
         --no-extensions \
         --extension "$ROOT/index.ts" \
         --no-skills \
@@ -161,5 +218,7 @@ run_pi_case "tool-once" "tool-once" "read package.json"
 assert_status 0
 assert_contains "$RUN_OUT" "fake tool followup"
 assert_not_contains "$RUN_OUT" "fake tool was not intercepted"
+assert_arg_log_all_spawns_have_tool "Read"
+assert_arg_log_any_spawn_has_flag "--resume"
 
 echo "e2e-fake-claude: ok"

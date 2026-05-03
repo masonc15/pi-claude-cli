@@ -124,6 +124,69 @@ assert_trace_not_contains() {
   fi
 }
 
+assert_trace_all_meta_have_tool() {
+  local expected="$1"
+  if ! node - "$RUN_TRACE_DIR" "$expected" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const [root, expected] = process.argv.slice(2);
+const dirs = fs.existsSync(root) ? fs.readdirSync(root) : [];
+const files = dirs
+  .map((dir) => path.join(root, dir, "meta.json"))
+  .filter((file) => fs.existsSync(file));
+
+if (files.length === 0) {
+  console.error("no trace meta.json files found");
+  process.exit(1);
+}
+
+for (const file of files) {
+  const meta = JSON.parse(fs.readFileSync(file, "utf-8"));
+  const args = Array.isArray(meta.args) ? meta.args : [];
+  const toolsIndex = args.indexOf("--tools");
+  if (toolsIndex < 0) {
+    console.error(`${file} is missing --tools: ${JSON.stringify(args)}`);
+    process.exit(1);
+  }
+  if (args[toolsIndex + 1] !== expected) {
+    console.error(
+      `${file} expected --tools ${expected}, got ${JSON.stringify(args[toolsIndex + 1])}: ${JSON.stringify(args)}`,
+    );
+    process.exit(1);
+  }
+}
+NODE
+  then
+    fail "expected every trace meta.json to include --tools $expected"
+  fi
+}
+
+assert_trace_any_meta_has_flag() {
+  local flag="$1"
+  if ! node - "$RUN_TRACE_DIR" "$flag" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const [root, flag] = process.argv.slice(2);
+const dirs = fs.existsSync(root) ? fs.readdirSync(root) : [];
+const files = dirs
+  .map((dir) => path.join(root, dir, "meta.json"))
+  .filter((file) => fs.existsSync(file));
+
+if (!files.some((file) => {
+  const meta = JSON.parse(fs.readFileSync(file, "utf-8"));
+  return Array.isArray(meta.args) && meta.args.includes(flag);
+})) {
+  console.error(`no trace meta.json included ${flag}`);
+  process.exit(1);
+}
+NODE
+  then
+    fail "expected at least one trace meta.json to include $flag"
+  fi
+}
+
 run_pi_case() {
   local name="$1"
   local thinking="$2"
@@ -346,6 +409,8 @@ assert_trace_contains "stdin.ndjson" "TOOL RESULT (historical Read):"
 assert_trace_contains "lifecycle.jsonl" '"event":"break_early"'
 assert_trace_contains "meta.json" "--tools"
 assert_trace_contains "meta.json" "Read"
+assert_trace_all_meta_have_tool "Read"
+assert_trace_any_meta_has_flag "--resume"
 
 run_pi_case \
   "memory-first" \
@@ -397,6 +462,8 @@ assert_session_contains 'pi-skill-e2e/SKILL.md'
 assert_trace_contains "system-prompt.txt" "pi-claude-skill-e2e"
 assert_trace_contains "stdout.ndjson" '"name":"Read"'
 assert_trace_contains "stdout.ndjson" '"tools":["Read"]'
+assert_trace_all_meta_have_tool "Read"
+assert_trace_any_meta_has_flag "--resume"
 assert_trace_not_contains "stdout.ndjson" "superpowers"
 assert_trace_not_contains "stdout.ndjson" '"name":"Glob"'
 assert_trace_not_contains "stdout.ndjson" '"name":"Bash"'

@@ -62,6 +62,7 @@ pi is the harness for prompts, skills, tools, and custom tool execution. To keep
 - `--setting-sources local` by default, which avoids user-level Claude Code plugins and hooks while preserving normal Claude Code auth
 - `--strict-mcp-config`, so Claude only sees the MCP config pi-claude-cli explicitly passes for custom pi tool schemas
 - `--tools <mapped built-ins>`, derived from pi's `Available tools:` section, so a read-only pi turn exposes Claude Code `Read` but not `Bash`, `Glob`, or unrelated native tools
+- `--disable-slash-commands`, so Claude Code native slash commands and native skills do not compete with Pi skills
 
 This matters for Pi skills. Pi lists skills as files and tells the model to load the listed `<location>` with `read`; Claude Code user plugins may instead inject native-skill instructions such as using the `Skill` tool. The isolation flags keep Opus focused on Pi's actual contract.
 

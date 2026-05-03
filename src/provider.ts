@@ -41,6 +41,7 @@ import { createEventBridge } from "./event-bridge.js";
 import { handleControlRequest } from "./control-handler.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
+import { extractAllowedClaudeTools } from "./tool-availability.js";
 import { createClaudeTrace } from "./claude-trace.js";
 /**
  * Inactivity timeout: kill the subprocess if no stdout for this long.
@@ -357,9 +358,9 @@ export function streamViaCli(
       const prompt = resumeSessionId
         ? buildResumePrompt(context)
         : buildPrompt(context);
-      const systemPrompt = resumeSessionId
-        ? undefined
-        : buildSystemPrompt(context, cwd);
+      const fullSystemPrompt = buildSystemPrompt(context, cwd);
+      const systemPrompt = resumeSessionId ? undefined : fullSystemPrompt;
+      const allowedTools = extractAllowedClaudeTools(fullSystemPrompt);
 
       // Compute effort level from reasoning options
       const effort = mapThinkingEffort(
@@ -394,6 +395,7 @@ export function streamViaCli(
         mcpConfigPath: options?.mcpConfigPath,
         resumeSessionId,
         newSessionId: !resumeSessionId ? options?.sessionId : undefined,
+        allowedTools,
         trace,
       });
       const getStderr = captureStderr(proc);

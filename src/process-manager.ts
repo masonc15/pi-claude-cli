@@ -52,6 +52,7 @@ export function spawnClaude(
     mcpConfigPath?: string;
     resumeSessionId?: string;
     newSessionId?: string;
+    allowedTools?: string[];
     trace?: ClaudeTrace;
   },
 ): ChildProcess {
@@ -67,6 +68,7 @@ export function spawnClaude(
     modelId,
     "--permission-prompt-tool",
     "stdio",
+    "--disable-slash-commands",
   ];
 
   const settingSources = claudeSettingSources();
@@ -97,7 +99,8 @@ export function spawnClaude(
     args.push("--append-system-prompt", tmpFile);
   }
 
-  const allowedTools = extractAllowedClaudeTools(systemPrompt);
+  const allowedTools =
+    options?.allowedTools ?? extractAllowedClaudeTools(systemPrompt);
   if (allowedTools) {
     args.push("--tools", allowedTools.join(","));
   }
