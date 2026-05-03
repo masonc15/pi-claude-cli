@@ -9,16 +9,7 @@ import { writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-
-/** The 6 built-in tools that pi handles natively (match pi tool names). */
-const BUILT_IN_TOOL_NAMES = new Set([
-  "read",
-  "write",
-  "edit",
-  "bash",
-  "grep",
-  "find",
-]);
+import { isBuiltInPiToolName } from "./tool-mapping.js";
 
 /** A custom tool definition with MCP-compatible schema. */
 export interface McpToolDef {
@@ -41,7 +32,7 @@ export function getCustomToolDefs(pi: any): McpToolDef[] {
   }
 
   return allTools
-    .filter((tool: any) => !BUILT_IN_TOOL_NAMES.has(tool.name))
+    .filter((tool: any) => !isBuiltInPiToolName(tool.name))
     .map((tool: any) => ({
       name: tool.name,
       description: tool.description,

@@ -1,9 +1,4 @@
-import { mapPiToolNameToClaude, TOOL_MAPPINGS } from "./tool-mapping.js";
-
-const BUILT_IN_PI_TOOL_NAMES = new Set([
-  ...TOOL_MAPPINGS.map((mapping) => mapping.pi),
-  "glob",
-]);
+import { isBuiltInPiToolName, mapPiToolNameToClaude } from "./tool-mapping.js";
 
 /**
  * Extract Claude built-in tool names from Pi's "Available tools" section.
@@ -32,7 +27,7 @@ export function extractAllowedClaudeTools(
     if (!match) break;
 
     const piToolName = match[1];
-    if (!BUILT_IN_PI_TOOL_NAMES.has(piToolName)) continue;
+    if (!isBuiltInPiToolName(piToolName)) continue;
 
     const claudeToolName = mapPiToolNameToClaude(piToolName);
     if (seen.has(claudeToolName)) continue;

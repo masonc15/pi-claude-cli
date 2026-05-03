@@ -9,11 +9,14 @@
 /**
  * A mapping entry for a single tool.
  * `args` maps Claude argument names to pi argument names (only renamed args).
+ * `piAliases` lists additional Pi names that should map back to the same
+ * Claude tool without changing the canonical Claude -> Pi direction.
  */
 export interface ToolMapping {
   claude: string;
   pi: string;
   args: Record<string, string>;
+  piAliases?: string[];
 }
 
 /**
@@ -29,17 +32,27 @@ export const TOOL_MAPPINGS: ToolMapping[] = [
   },
   { claude: "Bash", pi: "bash", args: {} },
   { claude: "Grep", pi: "grep", args: { head_limit: "limit" } },
-  { claude: "Glob", pi: "find", args: {} },
+  { claude: "Glob", pi: "find", args: {}, piAliases: ["glob"] },
 ];
 
 /** Prefix for custom pi tools exposed via MCP. */
 export const CUSTOM_TOOLS_MCP_PREFIX = "mcp__custom-tools__";
 
-/** Set of built-in pi tool names derived from TOOL_MAPPINGS for O(1) lookup. */
-const BUILT_IN_PI_NAMES = new Set(TOOL_MAPPINGS.map((m) => m.pi));
+/** Built-in pi tool names and aliases derived from TOOL_MAPPINGS for O(1) lookup. */
+export const BUILT_IN_PI_TOOL_NAMES: ReadonlySet<string> = new Set(
+  TOOL_MAPPINGS.flatMap((m) => [m.pi, ...(m.piAliases ?? [])]),
+);
+
+/** Check if a pi tool name is built in rather than custom. */
+export function isBuiltInPiToolName(piName: string): boolean {
+  return BUILT_IN_PI_TOOL_NAMES.has(piName);
+}
+
+/** Built-in pi tool names/aliases derived from TOOL_MAPPINGS for O(1) lookup. */
+const BUILT_IN_PI_NAMES = BUILT_IN_PI_TOOL_NAMES;
 
 /**
- * Check if a pi tool name is a custom tool (not one of the 6 built-in tools).
+ * Check if a pi tool name is a custom tool (not a built-in tool or alias).
  * Used by prompt builder to decide whether to add MCP prefix in history replay.
  */
 export function isCustomToolName(piName: string): boolean {
@@ -71,6 +84,9 @@ const PI_TO_CLAUDE_ARGS: Record<string, Record<string, string>> = {};
 for (const m of TOOL_MAPPINGS) {
   CLAUDE_TO_PI_NAME[m.claude.toLowerCase()] = m.pi;
   PI_TO_CLAUDE_NAME[m.pi] = m.claude;
+  for (const alias of m.piAliases ?? []) {
+    PI_TO_CLAUDE_NAME[alias] = m.claude;
+  }
   CLAUDE_TO_PI_ARGS[m.claude.toLowerCase()] = m.args;
 
   // Build reverse arg map
@@ -80,9 +96,6 @@ for (const m of TOOL_MAPPINGS) {
   }
   PI_TO_CLAUDE_ARGS[m.pi] = reverseArgs;
 }
-
-// Handle glob/find asymmetry: pi's "glob" also maps back to Claude's "Glob"
-PI_TO_CLAUDE_NAME["glob"] = "Glob";
 
 /**
  * Map a Claude tool name to the corresponding pi tool name.

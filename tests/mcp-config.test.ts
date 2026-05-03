@@ -115,6 +115,19 @@ describe("getCustomToolDefs", () => {
     expect(result).toEqual([]);
   });
 
+  it("filters Pi glob alias as a built-in tool", () => {
+    const mockPi = {
+      getAllTools: vi.fn(() => [
+        { name: "glob", description: "Find files", parameters: {} },
+        { name: "deploy", description: "Deploy", parameters: {} },
+      ]),
+    };
+
+    expect(getCustomToolDefs(mockPi)).toEqual([
+      { name: "deploy", description: "Deploy", inputSchema: {} },
+    ]);
+  });
+
   it("includes custom tool with correct name, description, inputSchema from parameters", () => {
     const customParams = {
       type: "object",

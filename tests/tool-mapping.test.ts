@@ -7,6 +7,7 @@ import {
   translateClaudeArgsToPi,
   translatePiArgsToClaude,
   isCustomToolName,
+  isBuiltInPiToolName,
 } from "../src/tool-mapping";
 
 describe("tool-mapping", () => {
@@ -230,13 +231,25 @@ describe("tool-mapping", () => {
       expect(isCustomToolName("deploy")).toBe(true);
     });
 
-    it("returns false for all 6 built-in tool names", () => {
+    it("returns false for all built-in tool names and aliases", () => {
       expect(isCustomToolName("read")).toBe(false);
       expect(isCustomToolName("write")).toBe(false);
       expect(isCustomToolName("edit")).toBe(false);
       expect(isCustomToolName("bash")).toBe(false);
       expect(isCustomToolName("grep")).toBe(false);
       expect(isCustomToolName("find")).toBe(false);
+      expect(isCustomToolName("glob")).toBe(false);
+    });
+  });
+
+  describe("isBuiltInPiToolName", () => {
+    it("returns true for canonical built-ins and Pi aliases", () => {
+      expect(isBuiltInPiToolName("find")).toBe(true);
+      expect(isBuiltInPiToolName("glob")).toBe(true);
+    });
+
+    it("returns false for custom tool names", () => {
+      expect(isBuiltInPiToolName("deploy")).toBe(false);
     });
   });
 
