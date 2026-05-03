@@ -1,0 +1,175 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+
+const args = process.argv.slice(2);
+const mode = process.env.PI_CLAUDE_CLI_FAKE_MODE ?? "text";
+const stateFile = process.env.PI_CLAUDE_CLI_FAKE_STATE_FILE;
+const argLog = process.env.PI_CLAUDE_CLI_FAKE_ARG_LOG;
+
+if (argLog) {
+  fs.appendFileSync(
+    argLog,
+    JSON.stringify({ mode, cwd: process.cwd(), args }) + "\n",
+  );
+}
+
+if (args.includes("--version")) {
+  process.stdout.write("fake-claude 1.0.0\n");
+  process.exit(0);
+}
+
+if (args[0] === "auth" && args[1] === "status") {
+  process.stdout.write("authenticated\n");
+  process.exit(0);
+}
+
+function line(value) {
+  process.stdout.write(JSON.stringify(value) + "\n");
+}
+
+function emitMessageStart() {
+  line({
+    type: "stream_event",
+    event: {
+      type: "message_start",
+      message: {
+        id: "msg_fake",
+        type: "message",
+        role: "assistant",
+        model: "fake-claude",
+        content: [],
+        usage: { input_tokens: 7, output_tokens: 0 },
+      },
+    },
+  });
+}
+
+function emitText(text) {
+  emitMessageStart();
+  line({
+    type: "stream_event",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    },
+  });
+  line({
+    type: "stream_event",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text },
+    },
+  });
+  line({
+    type: "stream_event",
+    event: { type: "content_block_stop", index: 0 },
+  });
+  line({
+    type: "stream_event",
+    event: {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn" },
+      usage: { output_tokens: 3 },
+    },
+  });
+  line({ type: "stream_event", event: { type: "message_stop" } });
+  line({ type: "result", subtype: "success", result: text });
+}
+
+function emitResultError() {
+  line({ type: "result", subtype: "error", error: "fake rate limit" });
+}
+
+function emitCrash() {
+  process.stderr.write("fake crash from claude\n");
+  process.exit(2);
+}
+
+function emitToolCallOnce() {
+  if (!stateFile) {
+    process.stderr.write("PI_CLAUDE_CLI_FAKE_STATE_FILE is required\n");
+    process.exit(2);
+  }
+
+  if (fs.existsSync(stateFile)) {
+    emitText("fake tool followup");
+    return;
+  }
+
+  fs.writeFileSync(stateFile, "tool-call-emitted\n");
+  emitMessageStart();
+  line({
+    type: "stream_event",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "tool_use",
+        id: "tool_fake_read",
+        name: "Read",
+        input: {},
+      },
+    },
+  });
+  line({
+    type: "stream_event",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: {
+        type: "input_json_delta",
+        partial_json: '{"file_path":"package.json"}',
+      },
+    },
+  });
+  line({
+    type: "stream_event",
+    event: { type: "content_block_stop", index: 0 },
+  });
+  line({
+    type: "stream_event",
+    event: {
+      type: "message_delta",
+      delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 6 },
+    },
+  });
+  line({ type: "stream_event", event: { type: "message_stop" } });
+
+  setTimeout(() => {
+    line({
+      type: "result",
+      subtype: "success",
+      result: "fake tool was not intercepted",
+    });
+    process.exit(0);
+  }, 5_000);
+}
+
+function hang() {
+  emitMessageStart();
+  setInterval(() => {}, 60_000);
+}
+
+switch (mode) {
+  case "text":
+    emitText("fake text response");
+    break;
+  case "error":
+    emitResultError();
+    break;
+  case "crash":
+    emitCrash();
+    break;
+  case "tool-once":
+    emitToolCallOnce();
+    break;
+  case "hang":
+    hang();
+    break;
+  default:
+    process.stderr.write(`unknown fake mode: ${mode}\n`);
+    process.exit(2);
+}

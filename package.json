@@ -51,6 +51,7 @@
   "scripts": {
     "test": "vitest run --reporter=verbose",
     "test:coverage": "vitest run --coverage",
+    "e2e:fake-claude": "scripts/e2e-fake-claude.sh",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format:check": "prettier --check .",
