@@ -32,10 +32,43 @@ Then select a Claude model via `/model` in the interactive UI. All Claude models
 - Maps tool names and arguments bidirectionally between Claude and pi
 - Exposes custom pi tools to Claude via MCP (schema-only, no execution)
 - Break-early pattern prevents Claude CLI from auto-executing tools
+- Constrains Claude Code's visible built-in tools to the tools pi advertised for the turn
+- Isolates subprocesses from user-level Claude Code plugins, hooks, and external MCPs by default
 - Session resume via `--resume` eliminates history replay on follow-up turns
 - Truthful, model-family-aware mapping from pi's thinking levels to Claude CLI `--effort`
 - Cross-platform subprocess management (Windows, macOS, Linux)
 - Inactivity timeout and process registry for cleanup
+
+## Claude trace mode
+
+Set `PI_CLAUDE_CLI_TRACE_DIR=/path/to/traces` to record one trace directory per Claude subprocess turn. This is intentionally opt-in because it stores prompts and raw model streams on disk.
+
+Each trace contains:
+
+- `meta.json`: model, cwd, session IDs, resolved effort, exact `claude` argv, and redacted auth-related environment facts
+- `system-prompt.txt`: the full prompt pi-claude-cli passes through `--append-system-prompt`
+- `stdin.ndjson`: every line pi-claude-cli writes to Claude Code, including the user message and permission/control responses
+- `stdout.ndjson`: every raw stream-json line emitted by Claude Code, including system events, tool calls, tool results, and result events
+- `stderr.log`: raw Claude Code stderr
+- `lifecycle.jsonl`: concise timing/index events for spawn, stdin writes, stdout lines, control requests, break-early kills, exits, aborts, and timeouts
+- `claude-debug.log`: Claude Code's own debug log, enabled by passing `--debug-file` only when trace mode is on
+
+When trace mode is enabled, pi-claude-cli also passes `--include-hook-events` so hook/system lifecycle events are included in `stdout.ndjson`. The trace records the whole process boundary that pi-claude-cli can observe; Claude Code's built-in internal system prompt is only visible if Claude Code itself exposes it in stream-json or debug output.
+
+## Claude Code isolation
+
+pi is the harness for prompts, skills, tools, and custom tool execution. To keep Claude Code from injecting a second harness into the same turn, pi-claude-cli starts Claude subprocesses with:
+
+- `--setting-sources local` by default, which avoids user-level Claude Code plugins and hooks while preserving normal Claude Code auth
+- `--strict-mcp-config`, so Claude only sees the MCP config pi-claude-cli explicitly passes for custom pi tool schemas
+- `--tools <mapped built-ins>`, derived from pi's `Available tools:` section, so a read-only pi turn exposes Claude Code `Read` but not `Bash`, `Glob`, or unrelated native tools
+
+This matters for Pi skills. Pi lists skills as files and tells the model to load the listed `<location>` with `read`; Claude Code user plugins may instead inject native-skill instructions such as using the `Skill` tool. The isolation flags keep Opus focused on Pi's actual contract.
+
+Two environment variables can relax the defaults for debugging:
+
+- `PI_CLAUDE_CLI_SETTING_SOURCES=default` omits `--setting-sources`; any other non-empty value is passed directly, such as `user,project,local`.
+- `PI_CLAUDE_CLI_STRICT_MCP_CONFIG=0` (also accepts `false`/`no`/`off`) omits `--strict-mcp-config`.
 
 ## Thinking effort
 

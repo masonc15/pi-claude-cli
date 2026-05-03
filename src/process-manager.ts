@@ -12,6 +12,27 @@ import { writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ChildProcess } from "node:child_process";
+import type { ClaudeTrace } from "./claude-trace.js";
+import { extractAllowedClaudeTools } from "./tool-availability.js";
+
+const DEFAULT_CLAUDE_SETTING_SOURCES = "local";
+
+function claudeSettingSources(): string | undefined {
+  const raw = process.env.PI_CLAUDE_CLI_SETTING_SOURCES;
+  if (raw === undefined) return DEFAULT_CLAUDE_SETTING_SOURCES;
+
+  const value = raw.trim();
+  if (value === "" || value.toLowerCase() === "default") return undefined;
+  return value;
+}
+
+function useStrictMcpConfig(): boolean {
+  const raw = process.env.PI_CLAUDE_CLI_STRICT_MCP_CONFIG;
+  if (raw === undefined) return true;
+
+  const value = raw.trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(value);
+}
 
 /**
  * Spawn a Claude CLI subprocess with all required flags for stream-json communication.
@@ -31,6 +52,7 @@ export function spawnClaude(
     mcpConfigPath?: string;
     resumeSessionId?: string;
     newSessionId?: string;
+    trace?: ClaudeTrace;
   },
 ): ChildProcess {
   const args = [
@@ -46,6 +68,15 @@ export function spawnClaude(
     "--permission-prompt-tool",
     "stdio",
   ];
+
+  const settingSources = claudeSettingSources();
+  if (settingSources) {
+    args.push("--setting-sources", settingSources);
+  }
+
+  if (useStrictMcpConfig()) {
+    args.push("--strict-mcp-config");
+  }
 
   if (options?.resumeSessionId) {
     // Resume an existing session — CLI loads prior conversation from disk
@@ -66,6 +97,11 @@ export function spawnClaude(
     args.push("--append-system-prompt", tmpFile);
   }
 
+  const allowedTools = extractAllowedClaudeTools(systemPrompt);
+  if (allowedTools) {
+    args.push("--tools", allowedTools.join(","));
+  }
+
   if (options?.effort) {
     args.push("--effort", options.effort);
   }
@@ -74,9 +110,29 @@ export function spawnClaude(
     args.push("--mcp-config", options.mcpConfigPath);
   }
 
+  if (options?.trace) {
+    args.push("--include-hook-events");
+    args.push("--debug-file", options.trace.debugFile);
+  }
+
   const proc = spawn("claude", args, {
     stdio: ["pipe", "pipe", "pipe"],
     cwd: options?.cwd ?? process.cwd(),
+  });
+
+  options?.trace?.writeMeta({
+    args,
+    command: "claude",
+    cwd: options?.cwd ?? process.cwd(),
+    systemPromptTempFile: systemPrompt
+      ? join(tmpdir(), `pi-claude-cli-sysprompt-${process.pid}.txt`)
+      : undefined,
+    childPid: proc.pid ?? null,
+  });
+  options?.trace?.record("spawn", {
+    command: "claude",
+    args,
+    childPid: proc.pid ?? null,
   });
 
   return proc as ChildProcess;
@@ -108,6 +164,7 @@ export function cleanupSystemPromptFile(): void {
 export function writeUserMessage(
   proc: ChildProcess,
   prompt: string | any[],
+  onWrite?: (line: string) => void,
 ): void {
   const message = {
     type: "user",
@@ -116,7 +173,9 @@ export function writeUserMessage(
       content: prompt,
     },
   };
-  proc.stdin!.write(JSON.stringify(message) + "\n");
+  const line = JSON.stringify(message) + "\n";
+  proc.stdin!.write(line);
+  onWrite?.(line);
 }
 
 /**

@@ -40,6 +40,7 @@ interface ControlResponse {
 export function handleControlRequest(
   msg: ClaudeControlRequest,
   stdin: NodeJS.WritableStream,
+  onWrite?: (line: string) => void,
 ): boolean {
   if (!msg.request_id || !msg.request) {
     console.error(
@@ -63,6 +64,8 @@ export function handleControlRequest(
     },
   };
 
-  stdin.write(JSON.stringify(response) + "\n");
+  const line = JSON.stringify(response) + "\n";
+  stdin.write(line);
+  onWrite?.(line);
   return !isCustomTool;
 }

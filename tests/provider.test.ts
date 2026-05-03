@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 // Mock cross-spawn with PassThrough streams for readline compatibility
 vi.mock("cross-spawn", () => ({
@@ -152,9 +161,11 @@ describe("streamViaCli", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    delete process.env.PI_CLAUDE_CLI_TRACE_DIR;
   });
 
   afterEach(() => {
+    delete process.env.PI_CLAUDE_CLI_TRACE_DIR;
     vi.useRealTimers();
   });
 
@@ -435,6 +446,140 @@ describe("streamViaCli", () => {
     const parsed = JSON.parse(controlResponse[0]);
     expect(parsed.request_id).toBe("req_123");
     expect(parsed.response.response.behavior).toBe("allow");
+  });
+
+  it("captures opt-in raw Claude subprocess traces", async () => {
+    const traceRoot = mkdtempSync(join(tmpdir(), "pi-claude-cli-trace-test-"));
+    process.env.PI_CLAUDE_CLI_TRACE_DIR = traceRoot;
+
+    try {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Trace this turn" }],
+        systemPrompt: "TRACE SYSTEM PROMPT",
+      };
+
+      streamViaCli(model, context, {
+        cwd: "/trace/cwd",
+        reasoning: "low",
+        sessionId: "00000000-0000-4000-8000-000000000001",
+      } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      const controlRequest = JSON.stringify({
+        type: "control_request",
+        request_id: "req_trace",
+        request: {
+          subtype: "can_use_tool",
+          tool_name: "Read",
+          input: { file_path: "package.json" },
+        },
+      });
+      const stdoutLines = [
+        JSON.stringify({
+          type: "system",
+          subtype: "hook_started",
+          hook_event: "SessionStart",
+        }),
+        controlRequest,
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 10, output_tokens: 0 } },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "traced" },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_stop", index: 0 },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 2 },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "message_stop" },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          result: "traced",
+        }),
+      ];
+
+      proc.stderr.emit("data", Buffer.from("trace stderr\n"));
+      for (const line of stdoutLines) {
+        proc.stdout.write(line + "\n");
+      }
+      proc.emit("close", 0, null);
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const [traceDirName] = readdirSync(traceRoot);
+      expect(traceDirName).toBeDefined();
+      const traceDir = join(traceRoot, traceDirName);
+      expect(existsSync(join(traceDir, "meta.json"))).toBe(true);
+      expect(
+        readFileSync(join(traceDir, "system-prompt.txt"), "utf-8"),
+      ).toContain("TRACE SYSTEM PROMPT");
+      expect(readFileSync(join(traceDir, "stdin.ndjson"), "utf-8")).toContain(
+        "Trace this turn",
+      );
+      expect(readFileSync(join(traceDir, "stdout.ndjson"), "utf-8")).toContain(
+        "hook_started",
+      );
+      expect(readFileSync(join(traceDir, "stdout.ndjson"), "utf-8")).toContain(
+        "control_request",
+      );
+      expect(readFileSync(join(traceDir, "stderr.log"), "utf-8")).toBe(
+        "trace stderr\n",
+      );
+
+      const meta = JSON.parse(
+        readFileSync(join(traceDir, "meta.json"), "utf-8"),
+      );
+      expect(meta.modelId).toBe(model.id);
+      expect(meta.cwd).toBe("/trace/cwd");
+      expect(meta.effort).toBe("low");
+      expect(meta.newSessionId).toBe("00000000-0000-4000-8000-000000000001");
+      expect(meta.env.hasAnthropicApiKey).toBe(false);
+      expect(meta.args).toContain("--append-system-prompt");
+      expect(meta.args).toContain("--effort");
+
+      const lifecycle = readFileSync(
+        join(traceDir, "lifecycle.jsonl"),
+        "utf-8",
+      );
+      expect(lifecycle).toContain('"event":"write_stdin"');
+      expect(lifecycle).toContain('"event":"stdout_line"');
+      expect(lifecycle).toContain('"event":"control_response"');
+      expect(lifecycle).toContain('"event":"stderr"');
+      expect(lifecycle).toContain('"event":"close"');
+    } finally {
+      rmSync(traceRoot, { recursive: true, force: true });
+    }
   });
 
   describe("thinking effort wiring", () => {
@@ -1336,6 +1481,87 @@ describe("streamViaCli", () => {
         (e: any) => e.type === "error",
       );
       expect(errorEvent).toBeUndefined();
+    });
+
+    it("pushes structured error when subprocess closes without a result event", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+
+      // Claude CLI can exit 0 after startup/system events without ever sending
+      // a result event, e.g. when stream-json auth fails before the assistant turn.
+      proc.stdout.write(
+        JSON.stringify({
+          type: "system",
+          subtype: "hook_started",
+          hook_event: "SessionStart",
+        }) + "\n",
+      );
+      proc.emit("close", 0, null);
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
+      );
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.reason).toBe("error");
+      expect(errorEvent.error.stopReason).toBe("error");
+      expect(errorEvent.error.errorMessage).toContain(
+        "Claude CLI exited without a result event",
+      );
+      expect(doneEvent).toBeUndefined();
+    });
+
+    it("pushes structured error when subprocess reports success without assistant stream events", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+
+      proc.stdout.write(
+        JSON.stringify({
+          type: "system",
+          subtype: "hook_response",
+          hook_event: "SessionStart",
+        }) + "\n",
+      );
+      proc.stdout.write(
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          result: "",
+        }) + "\n",
+      );
+      proc.emit("close", 0, null);
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
+      );
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.reason).toBe("error");
+      expect(errorEvent.error.stopReason).toBe("error");
+      expect(errorEvent.error.errorMessage).toContain(
+        "Claude CLI returned success without assistant stream events",
+      );
+      expect(doneEvent).toBeUndefined();
     });
 
     it("does not push error after break-early (broken flag)", async () => {

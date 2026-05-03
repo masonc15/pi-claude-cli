@@ -82,6 +82,23 @@ function emitResultError() {
   line({ type: "result", subtype: "error", error: "fake rate limit" });
 }
 
+function emitNoResult() {
+  line({
+    type: "system",
+    subtype: "hook_started",
+    hook_event: "SessionStart",
+  });
+}
+
+function emitSuccessNoMessage() {
+  line({
+    type: "system",
+    subtype: "hook_response",
+    hook_event: "SessionStart",
+  });
+  line({ type: "result", subtype: "success", result: "" });
+}
+
 function emitCrash() {
   process.stderr.write("fake crash from claude\n");
   process.exit(2);
@@ -159,6 +176,12 @@ switch (mode) {
     break;
   case "error":
     emitResultError();
+    break;
+  case "no-result":
+    emitNoResult();
+    break;
+  case "success-no-message":
+    emitSuccessNoMessage();
     break;
   case "crash":
     emitCrash();

@@ -910,6 +910,30 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("IMPORTANT:");
     expect(result).toContain("tool results");
   });
+
+  it("adds Pi skill loading guidance for available_skills blocks", async () => {
+    vi.doMock("node:fs", () => ({
+      existsSync: () => false,
+      readFileSync: () => "",
+    }));
+
+    const { buildSystemPrompt: bsp } = await import("../src/prompt-builder");
+    const context = {
+      systemPrompt: [
+        "<available_skills>",
+        "  <skill>",
+        "    <name>pi-claude-skill-e2e</name>",
+        "    <location>/tmp/pi-claude-skill-e2e/SKILL.md</location>",
+        "  </skill>",
+        "</available_skills>",
+      ].join("\n"),
+      messages: [],
+    } as unknown as any;
+    const result = bsp(context, "/some/project");
+    expect(result).toContain("Pi skills");
+    expect(result).toContain("Read tool");
+    expect(result).toContain("Do not search");
+  });
 });
 
 describe("buildResumePrompt", () => {

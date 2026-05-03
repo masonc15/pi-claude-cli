@@ -41,6 +41,7 @@ import { createEventBridge } from "./event-bridge.js";
 import { handleControlRequest } from "./control-handler.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
+import { createClaudeTrace } from "./claude-trace.js";
 /**
  * Inactivity timeout: kill the subprocess if no stdout for this long.
  *
@@ -367,6 +368,24 @@ export function streamViaCli(
         options?.thinkingBudgets,
       );
 
+      const trace = createClaudeTrace({
+        modelId: model.id,
+        cwd,
+        effort,
+        mcpConfigPath: options?.mcpConfigPath,
+        resumeSessionId,
+        newSessionId: !resumeSessionId ? options?.sessionId : undefined,
+      });
+      trace?.writeSystemPrompt(systemPrompt || undefined);
+      trace?.record("prompt_built", {
+        resume: Boolean(resumeSessionId),
+        promptKind: Array.isArray(prompt) ? "content_blocks" : "text",
+        promptBytes: Buffer.byteLength(
+          typeof prompt === "string" ? prompt : JSON.stringify(prompt),
+          "utf-8",
+        ),
+      });
+
       // Spawn subprocess
       proc = spawnClaude(model.id, systemPrompt || undefined, {
         cwd,
@@ -375,8 +394,12 @@ export function streamViaCli(
         mcpConfigPath: options?.mcpConfigPath,
         resumeSessionId,
         newSessionId: !resumeSessionId ? options?.sessionId : undefined,
+        trace,
       });
       const getStderr = captureStderr(proc);
+      proc.stderr!.on("data", (data: Buffer) => {
+        trace?.appendStderr(data.toString());
+      });
 
       // Register in global process registry for teardown cleanup
       registerProcess(proc);
@@ -388,6 +411,7 @@ export function streamViaCli(
 
       // Track tool_use blocks for break-early decision at message_stop
       let sawBuiltInOrCustomTool = false;
+      let sawAssistantStreamEvent = false;
 
       // Set up readline for line-by-line NDJSON parsing
       const rl = createInterface({
@@ -400,13 +424,15 @@ export function streamViaCli(
       // failures cannot close before the provider sees them.
       proc.on("error", (err: Error) => {
         if (broken) return; // Break-early killed the process intentionally
+        trace?.record("error", { message: err.message });
         const stderr = getStderr();
         endStreamWithError(stderr || err.message);
       });
 
       // Handle subprocess close -- attach before stdin write so immediate
       // CLI crashes are surfaced instead of becoming empty successful turns.
-      proc.on("close", (code: number | null, _signal: string | null) => {
+      proc.on("close", (code: number | null, signal: string | null) => {
+        trace?.record("close", { code, signal });
         processClosed = true;
         resolveProcessClose();
         clearTimeout(inactivityTimer);
@@ -424,6 +450,9 @@ export function streamViaCli(
       function resetInactivityTimer() {
         if (inactivityTimer !== undefined) clearTimeout(inactivityTimer);
         inactivityTimer = setTimeout(() => {
+          trace?.record("inactivity_timeout", {
+            timeoutMs: inactivityTimeoutMs,
+          });
           forceKillProcess(proc!);
           endStreamWithError(
             `Claude CLI subprocess timed out: no output for ${inactivityTimeoutMs / 1000} seconds`,
@@ -434,6 +463,7 @@ export function streamViaCli(
       // Set up abort signal handler -- uses SIGKILL for immediate force-kill
       if (options?.signal) {
         abortHandler = () => {
+          trace?.record("abort");
           if (proc) {
             forceKillProcess(proc);
           }
@@ -450,7 +480,7 @@ export function streamViaCli(
 
       // Write user message only after failure handlers and stdout reader are
       // attached; fake/real CLIs can fail immediately.
-      writeUserMessage(proc, prompt);
+      writeUserMessage(proc, prompt, (line) => trace?.appendStdin(line));
 
       // Start inactivity timer after writing user message
       resetInactivityTimer();
@@ -459,6 +489,8 @@ export function streamViaCli(
       // NOTE: Using 'line' event instead of `for await` because the async
       // iterator batches lines, breaking real-time streaming to pi.
       rl.on("line", (line: string) => {
+        trace?.appendStdoutLine(line);
+
         if (broken) return; // Guard: ignore buffered lines after break-early
 
         // Reset inactivity timer on each line of output
@@ -467,11 +499,20 @@ export function streamViaCli(
         const msg = parseLine(line);
         if (!msg) return;
 
+        trace?.record("parsed_stdout", {
+          type: (msg as any).type,
+          subtype: (msg as any).subtype,
+          streamEventType: (msg as any).event?.type,
+          toolName: (msg as any).event?.content_block?.name,
+          parentToolUseId: (msg as any).parent_tool_use_id ?? null,
+        });
+
         if (msg.type === "stream_event") {
           // Only forward top-level events to pi's event bridge.
           // Sub-agent events (parent_tool_use_id !== null) are internal to the CLI.
           const isTopLevel = !(msg as any).parent_tool_use_id;
           if (isTopLevel) {
+            sawAssistantStreamEvent = true;
             eventBridge.handleEvent(msg.event);
           }
 
@@ -486,6 +527,7 @@ export function streamViaCli(
               // Built-in tool (Read/Write/etc.) OR custom MCP tool (mcp__custom-tools__*)
               // Internal Claude Code tools (ToolSearch, Task, etc.) are excluded
               sawBuiltInOrCustomTool = true;
+              trace?.record("pi_known_tool_use_seen", { toolName });
             }
           }
 
@@ -498,17 +540,39 @@ export function streamViaCli(
           ) {
             broken = true; // Set guard BEFORE rl.close() to prevent buffered lines
             clearTimeout(inactivityTimer);
+            trace?.record("break_early", {
+              reason: "pi_will_execute_tool",
+            });
             // Pi will execute these tools. Kill subprocess to prevent CLI from executing them.
             forceKillProcess(proc!);
             rl.close();
             return; // Don't process further -- done event already pushed by event bridge
           }
         } else if (msg.type === "control_request") {
-          handleControlRequest(msg, proc!.stdin!);
+          const allowed = handleControlRequest(msg, proc!.stdin!, (line) => {
+            trace?.appendStdin(line);
+            trace?.record("control_response", {
+              requestId: (msg as any).request_id,
+              toolName: (msg as any).request?.tool_name,
+            });
+          });
+          trace?.record("control_request", {
+            requestId: (msg as any).request_id,
+            toolName: (msg as any).request?.tool_name,
+            allowed,
+          });
         } else if (msg.type === "result") {
           resultReceived = true;
+          trace?.record("result", {
+            subtype: msg.subtype,
+            hasAssistantStreamEvent: sawAssistantStreamEvent,
+          });
           if (msg.subtype === "error") {
             endStreamWithError(msg.error ?? "Unknown error from Claude CLI");
+          } else if (!sawAssistantStreamEvent) {
+            endStreamWithError(
+              "Claude CLI returned success without assistant stream events",
+            );
           }
           // For both success and error: clean up the subprocess
           clearTimeout(inactivityTimer);
@@ -530,6 +594,20 @@ export function streamViaCli(
           processClosePromise,
           new Promise((resolve) => setTimeout(resolve, 25)),
         ]);
+      }
+
+      if (
+        !streamEnded &&
+        !resultReceived &&
+        !broken &&
+        !sawAssistantStreamEvent
+      ) {
+        clearTimeout(inactivityTimer);
+        const stderr = getStderr().trim();
+        const message = stderr
+          ? `Claude CLI exited without a result event: ${stderr}`
+          : "Claude CLI exited without a result event";
+        endStreamWithError(message);
       }
 
       // Push done event after readline closes (async). Pushing synchronously
@@ -577,6 +655,8 @@ export function streamViaCli(
         stream.end();
       }
     } catch (err: any) {
+      // `trace` is scoped inside the try block so unexpected setup failures
+      // before it exists are reported through the normal stream error path.
       endStreamWithError(err.message ?? "Unexpected error in streamViaCli");
     } finally {
       // Clean up abort listener

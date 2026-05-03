@@ -387,6 +387,40 @@ describe("CLI flags", () => {
     const idx = args.indexOf("--permission-prompt-tool");
     expect(args[idx + 1]).toBe("stdio");
   });
+
+  it("isolates Claude Code user settings and external MCPs by default", () => {
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--setting-sources");
+    const idx = args.indexOf("--setting-sources");
+    expect(args[idx + 1]).toBe("local");
+    expect(args).toContain("--strict-mcp-config");
+  });
+
+  it("constrains Claude built-in tools to Pi's advertised tools", () => {
+    spawnClaude(
+      "claude-sonnet-4-5-20250929",
+      "Available tools:\n- read: Read file contents\n",
+    );
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--tools");
+    const idx = args.indexOf("--tools");
+    expect(args[idx + 1]).toBe("Read");
+  });
+
+  it("passes an empty --tools value when Pi advertises no built-ins", () => {
+    spawnClaude(
+      "claude-sonnet-4-5-20250929",
+      "Available tools:\n- deploy: Custom project tool\n",
+    );
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--tools");
+    const idx = args.indexOf("--tools");
+    expect(args[idx + 1]).toBe("");
+  });
 });
 
 describe("mcp-config flag", () => {
@@ -412,13 +446,13 @@ describe("mcp-config flag", () => {
     expect(args).not.toContain("--mcp-config");
   });
 
-  it("spawnClaude NEVER includes --strict-mcp-config in args", () => {
+  it("spawnClaude includes --strict-mcp-config with mcpConfigPath", () => {
     spawnClaude("claude-sonnet-4-5-20250929", undefined, {
       mcpConfigPath: "/tmp/mcp-config.json",
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).not.toContain("--strict-mcp-config");
+    expect(args).toContain("--strict-mcp-config");
   });
 
   it("backward compatibility - existing calls with only effort/cwd still work", () => {

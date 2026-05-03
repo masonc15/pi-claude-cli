@@ -44,6 +44,11 @@ type AnthropicContentBlock =
 /** Module-level counter for placeholder images, reset per buildPrompt call. */
 let placeholderImageCount = 0;
 
+const PI_SKILL_USAGE_GUIDANCE =
+  "IMPORTANT: The <available_skills> block lists Pi skills, not necessarily Claude Code native skills. " +
+  "When a listed Pi skill is relevant, use the exact <location> path shown for that skill directly with the Read tool to load its SKILL.md. " +
+  "Do not search for listed Pi skills with Glob, Grep, Bash, or the Skill tool unless the user explicitly asks you to discover skills.";
+
 /**
  * Translate a pi-ai image block to Anthropic API format.
  * Returns null if the block is missing required data/mimeType fields.
@@ -361,6 +366,9 @@ export function buildSystemPrompt(
 
   if (context.systemPrompt) {
     parts.push(context.systemPrompt);
+    if (hasPiSkillList(context.systemPrompt)) {
+      parts.push(PI_SKILL_USAGE_GUIDANCE);
+    }
   }
 
   // Look for AGENTS.md
@@ -385,6 +393,13 @@ export function buildSystemPrompt(
   }
 
   return parts.join("\n\n");
+}
+
+function hasPiSkillList(systemPrompt: string): boolean {
+  return (
+    systemPrompt.includes("<available_skills>") &&
+    systemPrompt.includes("<location>")
+  );
 }
 
 /**
