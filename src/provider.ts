@@ -153,6 +153,15 @@ function resultEnvelopeErrorMessage(msg: unknown): string {
     : `Claude CLI API error: ${message}`;
 }
 
+function isApiRetrySystemMessage(msg: unknown): boolean {
+  return (
+    !!msg &&
+    typeof msg === "object" &&
+    (msg as { type?: unknown }).type === "system" &&
+    (msg as { subtype?: unknown }).subtype === "api_retry"
+  );
+}
+
 function formatRateLimitWindow(rateLimitType?: string): string {
   switch (rateLimitType) {
     case "five_hour":
@@ -648,10 +657,11 @@ export function streamViaCli(
 
         if (broken) return; // Guard: ignore buffered lines after break-early
 
-        // Reset inactivity timer on each line of output
-        resetInactivityTimer();
-
         const msg = parseLine(line);
+        // api_retry is retry noise from Claude CLI, not assistant progress.
+        if (!isApiRetrySystemMessage(msg)) {
+          resetInactivityTimer();
+        }
         if (!msg) return;
 
         trace?.record("parsed_stdout", {

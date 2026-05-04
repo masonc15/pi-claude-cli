@@ -114,6 +114,14 @@ function emitSuccessNoMessage() {
   line({ type: "result", subtype: "success", result: "" });
 }
 
+function emitApiRetryLoop() {
+  line({ type: "system", subtype: "init", session_id: "fake-retry" });
+  line({ type: "system", subtype: "api_retry", error: "unknown" });
+  setInterval(() => {
+    line({ type: "system", subtype: "api_retry", error: "unknown" });
+  }, 250);
+}
+
 function emitCrash() {
   process.stderr.write("fake crash from claude\n");
   process.exit(2);
@@ -200,6 +208,9 @@ switch (mode) {
     break;
   case "success-no-message":
     emitSuccessNoMessage();
+    break;
+  case "api-retry":
+    emitApiRetryLoop();
     break;
   case "crash":
     emitCrash();

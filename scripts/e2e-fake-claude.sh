@@ -129,6 +129,7 @@ run_pi_case() {
   local name="$1"
   local mode="$2"
   local prompt="$3"
+  local provider_timeout_ms="${4:-}"
   local case_dir="$TMP_ROOT/$name"
   mkdir -p "$case_dir/agent" "$case_dir/sessions"
   RUN_OUT="$case_dir/stdout.txt"
@@ -148,6 +149,7 @@ run_pi_case() {
       PI_CLAUDE_CLI_FAKE_MODE="$mode" \
       PI_CLAUDE_CLI_FAKE_STATE_FILE="$state_file" \
       PI_CLAUDE_CLI_FAKE_ARG_LOG="$arg_log" \
+      PI_CLAUDE_CLI_TIMEOUT_MS="$provider_timeout_ms" \
       PI_CLAUDE_CLI_TRACE_DIR="$RUN_TRACE_DIR" \
       pi \
         --offline \
@@ -217,6 +219,11 @@ assert_contains "$RUN_ERR" "Claude CLI exited without a result event"
 run_pi_case "success-no-message" "success-no-message" "fail on empty success"
 assert_status_nonzero
 assert_contains "$RUN_ERR" "Claude CLI returned success without assistant stream events"
+
+run_pi_case "api-retry" "api-retry" "fail on api retries" "1000"
+assert_status_nonzero
+assert_contains "$RUN_ERR" "Claude CLI subprocess timed out: no output for 1 seconds"
+assert_trace_contains "stdout.ndjson" '"subtype":"api_retry"'
 
 run_pi_case "crash" "crash" "crash visibly"
 assert_status_nonzero

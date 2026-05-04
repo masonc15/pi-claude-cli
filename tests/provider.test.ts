@@ -1926,6 +1926,52 @@ describe("streamViaCli", () => {
       await vi.advanceTimersByTimeAsync(100);
     });
 
+    it("does not treat api_retry system events as progress for the inactivity timeout", async () => {
+      process.env.PI_CLAUDE_CLI_TIMEOUT_MS = "1000";
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.write(
+        JSON.stringify({
+          type: "system",
+          subtype: "init",
+          session_id: "retry-session",
+        }) + "\n",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      await vi.advanceTimersByTimeAsync(900);
+      proc.stdout.write(
+        JSON.stringify({
+          type: "system",
+          subtype: "api_retry",
+          error: "unknown",
+        }) + "\n",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
+      );
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.error.errorMessage).toContain(
+        "no output for 1 seconds",
+      );
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
     it("honors PI_CLAUDE_CLI_TIMEOUT_MS when no option override is set", async () => {
       process.env.PI_CLAUDE_CLI_TIMEOUT_MS = "1500";
       const model = mockModels[0] as any;
