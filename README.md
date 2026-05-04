@@ -56,6 +56,12 @@ Each trace contains:
 
 When trace mode is enabled, pi-claude-cli also passes `--include-hook-events` so hook/system lifecycle events are included in `stdout.ndjson`. The trace records the whole process boundary that pi-claude-cli can observe; Claude Code's built-in internal system prompt is only visible if Claude Code itself exposes it in stream-json or debug output.
 
+## Subprocess timeout
+
+By default, pi-claude-cli kills a Claude subprocess after 360 seconds with no stdout. The timer resets only when Claude Code emits another stdout line, so long-running thinking can continue as long as it is still streaming process events.
+
+Set `PI_CLAUDE_CLI_TIMEOUT_MS=<milliseconds>` to override that inactivity timeout for diagnostics or harnesses. Per-request pi `timeoutMs` options still win over this environment variable.
+
 ## Claude Code isolation
 
 pi is the harness for prompts, skills, tools, and custom tool execution. To keep Claude Code from injecting a second harness into the same turn, pi-claude-cli starts Claude subprocesses with:

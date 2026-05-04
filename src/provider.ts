@@ -72,6 +72,87 @@ type ClaudeRateLimitInfo = NonNullable<
   ClaudeRateLimitEventMessage["rate_limit_info"]
 >;
 
+function timeoutOverrideMs(): number | undefined {
+  const raw = process.env.PI_CLAUDE_CLI_TIMEOUT_MS?.trim();
+  if (!raw) return undefined;
+
+  const value = Number(raw);
+  if (Number.isFinite(value) && value > 0) return value;
+
+  console.warn(
+    `[pi-claude-cli] PI_CLAUDE_CLI_TIMEOUT_MS="${raw}" is not a positive number; using default timeout`,
+  );
+  return undefined;
+}
+
+function resolveTimeoutMs(optionsTimeoutMs: unknown): number {
+  if (
+    typeof optionsTimeoutMs === "number" &&
+    Number.isFinite(optionsTimeoutMs) &&
+    optionsTimeoutMs > 0
+  ) {
+    return optionsTimeoutMs;
+  }
+
+  return timeoutOverrideMs() ?? INACTIVITY_TIMEOUT_MS;
+}
+
+function extractTextContent(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+
+  const text = content
+    .map((block) => {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as { type?: unknown }).type === "text" &&
+        typeof (block as { text?: unknown }).text === "string"
+      ) {
+        return (block as { text: string }).text;
+      }
+      return "";
+    })
+    .join("");
+
+  return text || undefined;
+}
+
+function assistantErrorMessage(msg: unknown): string | undefined {
+  if (
+    !msg ||
+    typeof msg !== "object" ||
+    (msg as { type?: unknown }).type !== "assistant"
+  ) {
+    return undefined;
+  }
+
+  const error = (msg as { error?: unknown }).error;
+  if (typeof error !== "string" || !error) return undefined;
+
+  const text = extractTextContent(
+    (msg as { message?: { content?: unknown } }).message?.content,
+  );
+
+  return text ? `Claude CLI ${error}: ${text}` : `Claude CLI ${error}`;
+}
+
+function resultEnvelopeErrorMessage(msg: unknown): string {
+  const result =
+    typeof (msg as { result?: unknown }).result === "string"
+      ? (msg as { result: string }).result
+      : undefined;
+  const error =
+    typeof (msg as { error?: unknown }).error === "string"
+      ? (msg as { error: string }).error
+      : undefined;
+  const status = (msg as { api_error_status?: unknown }).api_error_status;
+  const message = error ?? result ?? "Unknown error from Claude CLI";
+
+  return typeof status === "number" && Number.isFinite(status)
+    ? `Claude CLI API error ${status}: ${message}`
+    : `Claude CLI API error: ${message}`;
+}
+
 function formatRateLimitWindow(rateLimitType?: string): string {
   switch (rateLimitType) {
     case "five_hour":
@@ -402,12 +483,7 @@ export function streamViaCli(
 
     try {
       const cwd = options?.cwd ?? process.cwd();
-      const inactivityTimeoutMs =
-        typeof options?.timeoutMs === "number" &&
-        Number.isFinite(options.timeoutMs) &&
-        options.timeoutMs > 0
-          ? options.timeoutMs
-          : INACTIVITY_TIMEOUT_MS;
+      const inactivityTimeoutMs = resolveTimeoutMs(options?.timeoutMs);
 
       // Resume only if pi provides a session ID AND a prior assistant turn in
       // this conversation went through pi-claude-cli. Pi passes sessionId on
@@ -586,6 +662,18 @@ export function streamViaCli(
           parentToolUseId: (msg as any).parent_tool_use_id ?? null,
         });
 
+        const assistantError = assistantErrorMessage(msg);
+        if (assistantError) {
+          trace?.record("assistant_error", {
+            error: (msg as any).error,
+          });
+          clearTimeout(inactivityTimer);
+          forceKillProcess(proc!);
+          endStreamWithError(assistantError);
+          rl.close();
+          return;
+        }
+
         if (msg.type === "stream_event") {
           // Only forward top-level events to pi's event bridge.
           // Sub-agent events (parent_tool_use_id !== null) are internal to the CLI.
@@ -653,10 +741,22 @@ export function streamViaCli(
           resultReceived = true;
           trace?.record("result", {
             subtype: msg.subtype,
+            isError: (msg as any).is_error === true,
+            apiErrorStatus: (msg as any).api_error_status ?? null,
             hasAssistantStreamEvent: sawAssistantStreamEvent,
           });
           if (msg.subtype === "error") {
             endStreamWithError(msg.error ?? "Unknown error from Claude CLI");
+            clearTimeout(inactivityTimer);
+            forceKillProcess(proc!);
+            rl.close();
+            return;
+          } else if ((msg as any).is_error === true) {
+            endStreamWithError(resultEnvelopeErrorMessage(msg));
+            clearTimeout(inactivityTimer);
+            forceKillProcess(proc!);
+            rl.close();
+            return;
           } else if (!sawAssistantStreamEvent) {
             endStreamWithError(
               "Claude CLI returned success without assistant stream events",

@@ -13,6 +13,8 @@ PI_MODEL="${PI_CLAUDE_CLI_REAL_MODEL:-pi-claude-cli/claude-opus-4-7}"
 PI_THINKING="${PI_CLAUDE_CLI_REAL_THINKING:-low}"
 PI_THINKING_LEVELS_RAW="${PI_CLAUDE_CLI_REAL_THINKING_LEVELS:-minimal low medium high xhigh}"
 TIMEOUT_SECONDS="${PI_CLAUDE_CLI_REAL_TIMEOUT_SECONDS:-240}"
+BAD_KEY_TIMEOUT_SECONDS="${PI_CLAUDE_CLI_REAL_BAD_KEY_TIMEOUT_SECONDS:-30}"
+BAD_KEY_PROVIDER_TIMEOUT_MS="${PI_CLAUDE_CLI_REAL_BAD_KEY_PROVIDER_TIMEOUT_MS:-15000}"
 RUN_OUT=""
 RUN_ERR=""
 RUN_STATUS=0
@@ -264,6 +266,7 @@ run_pi_bad_key_case() {
       NO_COLOR=1 \
       PI_CLAUDE_CLI_EFFORT= \
       PI_CLAUDE_CLI_MAX_MODE= \
+      PI_CLAUDE_CLI_TIMEOUT_MS="$BAD_KEY_PROVIDER_TIMEOUT_MS" \
       PI_CLAUDE_CLI_TRACE_DIR="$RUN_TRACE_DIR" \
       pi \
         --offline \
@@ -285,7 +288,7 @@ run_pi_bad_key_case() {
   local pid=$!
   local elapsed=0
   while kill -0 "$pid" 2>/dev/null; do
-    if [[ "$elapsed" -ge "$TIMEOUT_SECONDS" ]]; then
+    if [[ "$elapsed" -ge "$BAD_KEY_TIMEOUT_SECONDS" ]]; then
       kill "$pid" 2>/dev/null || true
       sleep 1
       kill -9 "$pid" 2>/dev/null || true
@@ -373,9 +376,12 @@ if [[ "${PI_CLAUDE_CLI_REAL_REQUIRE_FIRST_PARTY:-1}" != "0" ]]; then
 fi
 
 run_pi_bad_key_case
-assert_any_matches "Claude CLI (exited without a result event|returned success without assistant stream events)"
+assert_any_matches "Claude CLI (authentication_failed|API error( [0-9]+)?:|subprocess timed out: no output for|exited without a result event|returned success without assistant stream events)"
 assert_trace_contains "meta.json" "--debug-file"
 assert_trace_contains "meta.json" "--include-hook-events"
+assert_trace_contains "meta.json" '"hasAnthropicApiKey": true'
+assert_trace_contains "stdout.ndjson" '"apiKeySource":"ANTHROPIC_API_KEY"'
+assert_trace_not_contains "stdout.ndjson" "PI_REAL_OPUS_BAD_KEY_SHOULD_NOT_SUCCEED"
 assert_trace_contains "meta.json" "--setting-sources"
 assert_trace_contains "meta.json" "--strict-mcp-config"
 

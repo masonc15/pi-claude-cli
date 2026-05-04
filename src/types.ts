@@ -12,6 +12,8 @@ export interface ClaudeResultMessage {
   subtype: "success" | "error";
   result?: string;
   error?: string;
+  is_error?: boolean;
+  api_error_status?: number | null;
   session_id?: string;
 }
 
@@ -35,6 +37,15 @@ export interface ClaudeRateLimitEventMessage {
   session_id?: string;
 }
 
+export interface ClaudeAssistantMessage {
+  type: "assistant";
+  error?: string;
+  message?: {
+    content?: unknown[];
+  };
+  session_id?: string;
+}
+
 export interface ClaudeControlRequest {
   type: "control_request";
   request_id: string;
@@ -50,6 +61,7 @@ export type NdjsonMessage =
   | ClaudeResultMessage
   | ClaudeSystemMessage
   | ClaudeRateLimitEventMessage
+  | ClaudeAssistantMessage
   | ClaudeControlRequest;
 
 // Claude API event types (inside stream_event wrapper)

@@ -162,10 +162,12 @@ describe("streamViaCli", () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
     delete process.env.PI_CLAUDE_CLI_TRACE_DIR;
+    delete process.env.PI_CLAUDE_CLI_TIMEOUT_MS;
   });
 
   afterEach(() => {
     delete process.env.PI_CLAUDE_CLI_TRACE_DIR;
+    delete process.env.PI_CLAUDE_CLI_TIMEOUT_MS;
     vi.useRealTimers();
   });
 
@@ -1657,6 +1659,85 @@ describe("streamViaCli", () => {
       expect(doneEvent).toBeUndefined();
     });
 
+    it("pushes structured error when Claude emits a synthetic assistant error", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+
+      proc.stdout.write(
+        JSON.stringify({
+          type: "assistant",
+          error: "authentication_failed",
+          message: {
+            content: [
+              { type: "text", text: "Invalid API key · Fix external API key" },
+            ],
+          },
+        }) + "\n",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
+      );
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.reason).toBe("error");
+      expect(errorEvent.error.errorMessage).toBe(
+        "Claude CLI authentication_failed: Invalid API key · Fix external API key",
+      );
+      expect(doneEvent).toBeUndefined();
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("treats result is_error success envelopes as upstream errors", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+
+      proc.stdout.write(
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 401,
+          result: "Invalid API key · Fix external API key",
+        }) + "\n",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
+      );
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.error.errorMessage).toBe(
+        "Claude CLI API error 401: Invalid API key · Fix external API key",
+      );
+      expect(doneEvent).toBeUndefined();
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
     it("does not push error after break-early (broken flag)", async () => {
       const model = mockModels[0] as any;
       const context = {
@@ -1838,6 +1919,41 @@ describe("streamViaCli", () => {
       expect(errorEvent).toBeDefined();
       expect(errorEvent.error.errorMessage).toContain(
         "no output for 1.234 seconds",
+      );
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("honors PI_CLAUDE_CLI_TIMEOUT_MS when no option override is set", async () => {
+      process.env.PI_CLAUDE_CLI_TIMEOUT_MS = "1500";
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+
+      await vi.advanceTimersByTimeAsync(1_499);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const beforeTimeout = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
+      );
+      expect(beforeTimeout).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
+      );
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.error.errorMessage).toContain(
+        "no output for 1.5 seconds",
       );
       expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
 
