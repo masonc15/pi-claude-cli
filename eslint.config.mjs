@@ -10,6 +10,7 @@ export default defineConfig([
     "dist/",
     "coverage/",
     "package/",
+    ".worktrees/",
     "test-mcp-control.cjs",
   ]),
   eslint.configs.recommended,
